@@ -114,6 +114,7 @@ class MpsPlaywright(WxGather):
                         data=item,
                         Ext_Data={"mp_title": Mps_title, "mp_id": Mps_id},
                     )
+            self.Complete(Mps_id)
             print_success(f"Playwright 模式采集完成，共 {len(articles)} 条")
 
         except Exception as e:

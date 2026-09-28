@@ -196,7 +196,8 @@ async def get_mp_articles_source(
     # current_user: dict = Depends(get_current_user)
 ):
     limit = clamp_rss_limit(limit)
-    rss=RSS(name=f'{tag_id}_{feed_id}_{limit}_{offset}',ext=ext)
+    cache_variant = content_type or "default"
+    rss=RSS(name=f'{tag_id}_{feed_id}_{limit}_{offset}_{cache_variant}',ext=ext)
     rss.set_content_type(content_type)
     rss_xml = rss.get_cache()
     if rss_xml is not None and is_update==False:

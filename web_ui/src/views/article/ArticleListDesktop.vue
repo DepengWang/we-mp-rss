@@ -7,7 +7,7 @@
         <a-card :bordered="false" title="公众号"
           :headStyle="{ padding: '12px 16px', borderBottom: '1px solid #eee', background: '#fff', zIndex: 1, border: 0 }">
           <template #extra>
-            <a-dropdown>
+            <a-dropdown :popup-max-height="false">
               <a-button type="primary">
                 <template #icon><icon-plus /></template>
                 订阅
@@ -19,6 +19,7 @@
                 <a-doption @click="exportMPS"><template #icon><icon-export /></template>导出公众号</a-doption>
                 <a-doption @click="importMPS"><template #icon><icon-import /></template>导入公众号</a-doption>
                 <a-doption @click="exportOPML"><template #icon><icon-share-external /></template>导出OPML</a-doption>
+                <a-doption @click="exportCleanOPML"><template #icon><icon-share-external /></template>导出纯净版OPML</a-doption>
               </template>
             </a-dropdown>
           </template>
@@ -355,7 +356,7 @@ import { ref, onMounted, h, nextTick, watch, computed, resolveComponent } from '
 import axios from 'axios'
 import { IconApps, IconAtt, IconDelete, IconEdit, IconEye, IconRefresh, IconScan, IconWeiboCircleFill, IconWifi, IconCode, IconCheck, IconClose, IconStop, IconPlayArrow, IconCopy, IconPlus, IconDown, IconExport, IconImport, IconShareExternal, IconStar, IconStarFill, IconLink, IconSettings } from '@arco-design/web-vue/es/icon'
 import { getArticles, deleteArticle as deleteArticleApi, ClearArticle, ClearDuplicateArticle, getArticleDetail, getRefreshArticleTaskStatus, refreshArticle as refreshArticleApi, toggleArticleFavoriteStatus, toggleArticleReadStatus, cleanOldArticles } from '@/api/article'
-import { ExportOPML, ExportMPS, ImportMPS } from '@/api/export'
+import { ExportOPML, ExportCleanOPML, ExportMPS, ImportMPS } from '@/api/export'
 import ExportModal from '@/components/ExportModal.vue'
 import { addFeaturedArticle, getFeaturedArticleTaskStatus, getSubscriptions, UpdateMps, toggleMpStatus as toggleMpStatusApi } from '@/api/subscription'
 import { inject } from 'vue'
@@ -915,6 +916,24 @@ const exportOPML = async () => {
   } catch (error) {
     console.error('导出OPML失败:', error);
     Message.error(error?.message || '导出OPML失败');
+  }
+};
+const exportCleanOPML = async () => {
+  try {
+    const response = await ExportCleanOPML();
+    const data = (response as any).data ?? response;
+    const blob = data instanceof Blob ? data : new Blob([data], { type: 'application/xml' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '公众号清爽版订阅列表.opml';
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    document.body.removeChild(a);
+  } catch (error: any) {
+    console.error('导出纯净版OPML失败:', error);
+    Message.error(error?.message || '导出纯净版OPML失败');
   }
 };
 const exportMPS = async () => {

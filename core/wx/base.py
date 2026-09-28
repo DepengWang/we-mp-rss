@@ -332,14 +332,24 @@ class WxGather:
                 return
             import time
             self.start_time = time.time()  # 记录开始执行时间
-            self.update_mps(
-                mp_id, #type: ingnore
-                            Feed( 
-            sync_time=int(time.time()),
-            update_time=int(time.time()),
-            ))
+            self._gather_mp_id = mp_id
+            self._gather_completed = False
         except Exception as e:
             print_error(f"开始采集失败: {e}")
+
+    def Complete(self, mp_id=None):
+        """Commit the feed cursor only after a successful collection."""
+        if getattr(self, "_gather_completed", False):
+            return
+        mp_id = mp_id or getattr(self, "_gather_mp_id", None)
+        if not mp_id:
+            return
+        now = int(time.time())
+        self.update_mps(
+            mp_id,
+            Feed(sync_time=now, update_time=now),
+        )
+        self._gather_completed = True
 
     def Item_Over(self,item=None,CallBack=None):
         print(f"item end")

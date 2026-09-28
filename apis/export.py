@@ -7,6 +7,7 @@ from core.db import DB
 from core.wx import search_Biz
 from .base import success_response, error_response
 from datetime import datetime
+from xml.sax.saxutils import escape as xml_escape
 from core.config import cfg
 from core.res import save_avatar_locally
 import csv
@@ -163,6 +164,7 @@ async def export_mps_opml(
     limit: int = Query(1000, ge=1, le=10000),
     offset: int = Query(0, ge=0),
     kw: str = Query(""),
+    clean: bool = Query(False, description="是否导出清爽版 RSS 链接"),
     current_user: dict = Depends(get_current_user_or_ak)
 ):
     session = DB.get_session()
@@ -180,15 +182,21 @@ async def export_mps_opml(
         opml_content = '''<?xml version="1.0" encoding="UTF-8"?>
 <opml version="1.0">
   <head>
-    <title>公众号订阅列表</title>
+    <title>{title}</title>
     <dateCreated>{date}</dateCreated>
   </head>
   <body>
 {outlines}
   </body>
 </opml>'''.format(
+            title="公众号清爽版订阅列表" if clean else "公众号订阅列表",
             date=datetime.now().isoformat(),
-            outlines=''.join([f'<outline text="{mp.mp_name}" title="{mp.mp_name}" type="rss"  xmlUrl="{rss_domain}feed/{mp.id}.atom"/>\n' for mp in mps])
+            outlines=''.join([
+                f'<outline text="{xml_escape(mp.mp_name or "")}" '
+                f'title="{xml_escape(mp.mp_name or "")}" type="rss" '
+                f'xmlUrl="{rss_domain}feed/{mp.id}.rss{("?ctype=clean" if clean else "")}"/>\n'
+                for mp in mps
+            ])
         )
 
         # 创建临时OPML文件
@@ -200,7 +208,7 @@ async def export_mps_opml(
         return FileResponse(
             temp_file,
             media_type="application/xml",
-            filename="公众号订阅列表.opml",
+            filename="公众号清爽版订阅列表.opml" if clean else "公众号订阅列表.opml",
             background=BackgroundTask(lambda: os.remove(temp_file))
         )
 

@@ -50,6 +50,7 @@ class MpsAppMsg(WxGather):
         max_retries = 3
         while True:
             if i >= MaxPage:
+                self.Complete(Mps_id)
                 break
             begin = i * count
             params["begin"] = str(begin)
@@ -69,8 +70,22 @@ class MpsAppMsg(WxGather):
                         print_warning(f"频率限制, 第{retry_count}次重试...")
                         time.sleep(60 * retry_count)  # 递增等待
                         continue
-                    super().Error("frequencey control, stop at {}".format(str(begin)))
-                    break
+                    print_warning(
+                        "触发频率限制(ret=200013)，自动降级到 free_publish 模式..."
+                    )
+                    self._fallback_to_free_publish(
+                        faker_id,
+                        Mps_id,
+                        Mps_title,
+                        CallBack,
+                        start_page,
+                        MaxPage,
+                        interval,
+                        Gather_Content,
+                        Item_Over_CallBack,
+                        Over_CallBack,
+                    )
+                    return
                 
                 if msg['base_resp']['ret'] == 200003:
                     super().Error("Invalid Session, stop at {}".format(str(begin)),code="Invalid Session")
@@ -86,6 +101,7 @@ class MpsAppMsg(WxGather):
                     return
                 # 如果返回的内容中为空则结束
                 if 'publish_page' not in msg:
+                    self.Complete(Mps_id)
                     super().Error("all ariticle parsed")
                     break
                 if msg['base_resp']['ret'] != 0:
@@ -121,6 +137,7 @@ class MpsAppMsg(WxGather):
                 break
             finally:
                 super().Item_Over(item={"mps_id":Mps_id,"mps_title":Mps_title},CallBack=Item_Over_CallBack)
+        self.Complete(Mps_id)
         super().Over(CallBack=Over_CallBack)
         pass
 
@@ -132,6 +149,7 @@ class MpsAppMsg(WxGather):
             print_info("===== 自动降级到 free_publish 多端点模式 =====")
             from core.wx.model.free_publish import MpsFreePublish
             fp = MpsFreePublish()
+            fp._auto_fallback = True
             # 共享 token 和 session
             fp.token = self.token
             fp.cookies = self.cookies

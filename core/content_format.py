@@ -12,7 +12,36 @@ def format_content(content:str,content_format:str='html'):
     if not content:
         return ""
     try:
-        if content_format == 'text':
+        if content_format == 'clean':
+            soup = BeautifulSoup(content, 'html.parser')
+            for tag in soup.find_all(['script', 'style', 'iframe', 'form', 'noscript']):
+                tag.decompose()
+
+            # 微信图片经常使用懒加载属性，真实地址不一定放在 src 中。
+            # 先统一恢复到 src，再清理非语义属性，避免清爽版丢图或丢失图片地址。
+            for img in soup.find_all('img'):
+                src = img.get('src', '')
+                if not src or src.startswith('data:'):
+                    for attr in ('data-src', 'data-original', 'data-lazy-src', 'data-backup-src'):
+                        candidate = img.get(attr)
+                        if candidate:
+                            img['src'] = candidate
+                            break
+                if img.get('title') and not img.get('alt'):
+                    img['alt'] = img['title']
+
+            allowed_attrs = {
+                'a': {'href', 'title'},
+                'img': {'src', 'alt', 'title'},
+            }
+            for tag in soup.find_all(True):
+                attrs = allowed_attrs.get(tag.name, set())
+                tag.attrs = {key: value for key, value in tag.attrs.items() if key in attrs}
+            for tag in soup.find_all(['span', 'font']):
+                tag.unwrap()
+            content = str(soup)
+            content = re.sub(r'\n\s*\n\s*\n+', '\n\n', content)
+        elif content_format == 'text':
             # 去除HTML标签，保留纯文本
             soup = BeautifulSoup(content, 'html.parser')
             text = soup.get_text().strip()

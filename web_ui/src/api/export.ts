@@ -38,3 +38,10 @@ export const ImportTags = (formData: FormData) => {
     }
   })
 }
+
+export const ExportCleanOPML = () => {
+  return http.get('/wx/export/mps/opml', {
+    params: { limit: 1000, offset: 0, clean: true },
+    responseType: 'blob',
+  })
+}

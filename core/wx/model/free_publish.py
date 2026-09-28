@@ -187,6 +187,29 @@ class MpsFreePublish(WxGather):
 
         if effective_endpoint is None:
             super().Error("所有端点均不可用，请检查登录状态或尝试 Playwright 模式")
+            if getattr(self, "_auto_fallback", False):
+                try:
+                    print_info("所有 HTTP 端点均不可用，自动降级到 Playwright 模式...")
+                    from core.wx.model.playwright_mp import MpsPlaywright
+                    pw = MpsPlaywright()
+                    pw.token = self.token
+                    pw.cookies = self.cookies
+                    pw.session = self.session
+                    pw.get_Articles(
+                        faker_id=faker_id,
+                        Mps_id=Mps_id,
+                        Mps_title=Mps_title,
+                        CallBack=CallBack,
+                        start_page=start_page,
+                        MaxPage=MaxPage,
+                        interval=interval,
+                        Gather_Content=Gather_Content,
+                        Item_Over_CallBack=Item_Over_CallBack,
+                        Over_CallBack=Over_CallBack,
+                    )
+                except Exception as e:
+                    print_error(f"Playwright 自动降级失败: {e}")
+                    super().Error(f"所有采集方式均失败: {e}")
             return
 
         # 使用有效端点开始采集
@@ -203,6 +226,7 @@ class MpsFreePublish(WxGather):
         i = start_page
         while True:
             if i >= MaxPage:
+                self.Complete(Mps_id)
                 break
             begin = i * count
             params["begin"] = str(begin)
@@ -234,6 +258,7 @@ class MpsFreePublish(WxGather):
                 # 解析文章列表
                 articles = self._parse_response(msg, list_key, item_parser_name)
                 if not articles:
+                    self.Complete(Mps_id)
                     super().Error("all article parsed")
                     break
 
@@ -268,6 +293,7 @@ class MpsFreePublish(WxGather):
                     CallBack=Item_Over_CallBack,
                 )
 
+        self.Complete(Mps_id)
         super().Over(CallBack=Over_CallBack)
 
     def _has_valid_data(self, msg, list_key, parser):

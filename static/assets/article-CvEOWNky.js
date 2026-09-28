@@ -1,0 +1,1 @@
+import{v as e}from"./http-CmGXv9Kl.js";export{e as getArticles};

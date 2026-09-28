@@ -138,10 +138,14 @@ class RSS:
                 enclosure.set("type", "image/jpeg")
             if full_context==True:
                 try:
+                    # RSS 与 Atom/JSON 使用同一套正文格式化逻辑。
+                    # html 保持原文，clean/text/markdown 按请求参数转换。
+                    content = format_content(
+                        str(rss_item['content']),
+                        self.get_content_type(),
+                    )
                     if cfg.get("rss.cdata",False)==True:
-                        content = f"<![CDATA[{str(rss_item['content'])}]]>"  # 使用CDATA包裹内容
-                    else:
-                        content = str(rss_item['content'])
+                        content = f"<![CDATA[{content}]]>"  # 使用CDATA包裹内容
                     ET.SubElement(item, "content:encoded").text = content
                 except Exception as e:
                     print(f"Error adding content:encoded element: {e}")
@@ -234,11 +238,13 @@ class RSS:
                 f.write(tree_str)
         return tree_str
     def set_content_type(self,type:str=None):
-        self.content_type=type
+        self.content_type = type.lower().strip() if isinstance(type, str) else None
     def get_content_type(self)->str:
+        if getattr(self, 'content_type', None) in ('html', 'clean', 'markdown', 'text'):
+            return self.content_type
         ext=self.ext
         if ext in("atom","xml","json","markdown"):
-            return "html",
+            return "html"
         elif ext in("md","jmd"):
             return "markdown"
         elif ext in("txt"):

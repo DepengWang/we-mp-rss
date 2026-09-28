@@ -46,6 +46,7 @@ class MpsApi(WxGather):
         max_retries = 3
         while True:
             if i >= MaxPage:
+                self.Complete(Mps_id)
                 break
             begin = i * count
             params["begin"] = str(begin)
@@ -84,6 +85,7 @@ class MpsApi(WxGather):
                                                         start_page, MaxPage, interval,
                                                         Gather_Content, Item_Over_CallBack, Over_CallBack)
                         return
+                    self.Complete(Mps_id)
                     super().Error("all ariticle parsed")
                     break
                 if msg['base_resp']['ret'] != 0:
@@ -114,6 +116,7 @@ class MpsApi(WxGather):
                 break
             finally:
                 super().Item_Over(item={"mps_id":Mps_id,"mps_title":Mps_title},CallBack=Item_Over_CallBack)
+        self.Complete(Mps_id)
         super().Over(CallBack=Over_CallBack)
         pass
 

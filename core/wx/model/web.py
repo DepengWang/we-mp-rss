@@ -50,6 +50,7 @@ class MpsWeb(WxGather):
         max_retries = 3
         while True:
             if i >= MaxPage:
+                self.Complete(Mps_id)
                 break
             begin = i * count
             params["begin"] = str(begin)
@@ -95,6 +96,7 @@ class MpsWeb(WxGather):
                     return
                 # 如果返回的内容中为空则结束
                 if 'publish_page' not in msg:
+                    self.Complete(Mps_id)
                     super().Error("all ariticle parsed")
                     break
                 if msg['base_resp']['ret'] != 0:
@@ -131,6 +133,7 @@ class MpsWeb(WxGather):
                 break
             finally:
                 super().Item_Over(item={"mps_id":Mps_id,"mps_title":Mps_title},CallBack=Item_Over_CallBack)
+        self.Complete(Mps_id)
         super().Over(CallBack=Over_CallBack)
         pass
     def _fallback_to_free_publish(self, faker_id, Mps_id, Mps_title, CallBack,
