@@ -14,9 +14,11 @@ Playwright 浏览器模式采集器 - 兜底方案
 """
 
 import json
+import os
 import time
 import random
 import asyncio
+from pathlib import Path
 from typing import Dict, List, Optional
 from core.wx.base import WxGather
 from core.print import print_error, print_info, print_warning, print_success
@@ -155,20 +157,35 @@ class MpsPlaywright(WxGather):
             )
             
             try:
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    viewport={"width": 1920, "height": 1080},
-                    locale="zh-CN",
+                context_options = {
+                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "viewport": {"width": 1920, "height": 1080},
+                    "locale": "zh-CN",
+                }
+
+                # 复用容器数据卷中的 Playwright 会话状态。
+                # 该文件只保存运行时登录态，不进入代码仓库。
+                state_path = Path(
+                    os.environ.get(
+                        "WX_PLAYWRIGHT_STATE_PATH",
+                        "./data/wx-playwright-state.json",
+                    )
                 )
+                if state_path.is_file():
+                    try:
+                        json.loads(state_path.read_text(encoding="utf-8"))
+                        context_options["storage_state"] = str(state_path)
+                        print_info(f"已加载 Playwright 会话状态: {state_path}")
+                    except Exception as exc:
+                        print_warning(f"Playwright 会话状态无效，将重新建立: {exc}")
+
+                context = await browser.new_context(**context_options)
 
                 # 加载已保存的 Cookie
-                if self.cookies:
-                    cookie_str = self.cookies
-                    if isinstance(cookie_str, str) and cookie_str:
-                        cookies_to_set = self._parse_cookie_string(cookie_str)
-                        if cookies_to_set:
-                            await context.add_cookies(cookies_to_set)
-                            print_info("已加载保存的 Cookie")
+                cookies_to_set = self._load_browser_cookies()
+                if cookies_to_set:
+                    await context.add_cookies(cookies_to_set)
+                    print_info(f"已加载公众号浏览器 Cookie: {len(cookies_to_set)} 项")
 
                 page = await context.new_page()
 
@@ -238,6 +255,11 @@ class MpsPlaywright(WxGather):
                     print_error("Playwright 模式下需要重新扫码登录")
                     return None
 
+                # 登录态有效时保存最新的 Cookie/LocalStorage，供下次容器内复用。
+                if not state_path.parent.exists():
+                    state_path.parent.mkdir(parents=True, exist_ok=True)
+                await context.storage_state(path=str(state_path))
+
                 # ---- 解析拦截到的数据 ----
                 if captured_responses:
                     print_success(f"成功拦截到 {len(captured_responses)} 个包含文章数据的响应")
@@ -300,6 +322,51 @@ class MpsPlaywright(WxGather):
                     "path": "/",
                 })
         return cookies
+
+    def _load_browser_cookies(self) -> List[Dict]:
+        """合并项目保存的 Cookie、配置 Cookie 和 token，避免丢失正确域信息。"""
+        cookies: List[Dict] = []
+
+        try:
+            from driver.store import Store
+
+            stored = Store.load()
+            if isinstance(stored, list):
+                cookies.extend(stored)
+        except Exception as exc:
+            print_warning(f"读取加密公众号 Cookie 失败，将使用配置 Cookie: {exc}")
+
+        if isinstance(self.cookies, str) and self.cookies:
+            cookies.extend(self._parse_cookie_string(self.cookies))
+
+        # token 同时作为查询参数和 Cookie 提供，兼容部分后台页面的校验方式。
+        if self.token:
+            cookies.append({
+                "name": "token",
+                "value": str(self.token),
+                "domain": ".mp.weixin.qq.com",
+                "path": "/",
+            })
+
+        normalized: List[Dict] = []
+        seen = set()
+        now = time.time()
+        for raw in cookies:
+            if not isinstance(raw, dict) or not raw.get("name"):
+                continue
+            item = dict(raw)
+            if "expiry" in item and "expires" not in item:
+                item["expires"] = item.pop("expiry")
+            if item.get("expires") and float(item["expires"]) <= now:
+                continue
+            item.setdefault("domain", ".mp.weixin.qq.com")
+            item.setdefault("path", "/")
+            key = (item["name"], item["domain"], item["path"])
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(item)
+        return normalized
 
     def _parse_captured_response(self, body: Dict) -> List[Dict]:
         """
