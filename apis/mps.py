@@ -1,4 +1,5 @@
 from logging import info
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.background import BackgroundTasks
@@ -371,7 +372,8 @@ async def update_mps(
         from core.wx import WxGather
         wx = WxGather().Model()
         try:
-            wx.get_Articles(
+            await asyncio.to_thread(
+                wx.get_Articles,
                 mp.faker_id,
                 Mps_id=mp.id,
                 Mps_title=mp.mp_name,

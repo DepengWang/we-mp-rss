@@ -6,6 +6,7 @@
 
 import json
 import os
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -381,7 +382,8 @@ async def collect_weread_notes(
             return False
 
     try:
-        wx.get_Articles(
+        await asyncio.to_thread(
+            wx.get_Articles,
             faker_id=faker_id or None,
             Mps_id=mp_id,
             Mps_title=req.mp_name or faker_id or "微信读书",
