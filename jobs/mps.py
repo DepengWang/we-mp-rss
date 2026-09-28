@@ -80,7 +80,11 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                         print_warning(f"[{mp.mp_name}] 微信读书 Cookie 未配置，跳过采集")
                         raise RuntimeError("微信读书 Cookie 未配置")
                 try:
-                    wx.get_Articles(mp.faker_id,CallBack=UpdateArticle,Mps_id=mp.id,Mps_title=mp.mp_name, MaxPage=1,Over_CallBack=Update_Over,interval=interval)
+                    from core.wx.collection_guard import CollectionGuard
+                    guard = CollectionGuard(mp.id)
+                    with guard.hold():
+                        wx.get_Articles(mp.faker_id,CallBack=UpdateArticle,Mps_id=mp.id,Mps_title=mp.mp_name, MaxPage=1,Over_CallBack=Update_Over,interval=interval)
+                    guard.record_success()
                     success = True
                 except Exception as e:
                     print_error(f"获取文章失败 [{mp.mp_name}]: {e}")

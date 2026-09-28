@@ -370,16 +370,31 @@ async def update_mps(
         # 同步采集，等待结果返回；失败时把真实原因透出给前端，
         # 避免「异步线程 + 异常被吞」导致前端只看到“刷新成功”但实际 0 篇入库。
         from core.wx import WxGather
+        from core.wx.collection_guard import (
+            CollectionBusyError,
+            CollectionCooldownError,
+            CollectionGuard,
+        )
         wx = WxGather().Model()
+        guard = CollectionGuard(mp.id)
         try:
-            await asyncio.to_thread(
-                wx.get_Articles,
-                mp.faker_id,
-                Mps_id=mp.id,
-                Mps_title=mp.mp_name,
-                CallBack=UpdateArticle,
-                start_page=start_page,
-                MaxPage=end_page,
+            with guard.hold():
+                await asyncio.to_thread(
+                    wx.get_Articles,
+                    mp.faker_id,
+                    Mps_id=mp.id,
+                    Mps_title=mp.mp_name,
+                    CallBack=UpdateArticle,
+                    start_page=start_page,
+                    MaxPage=end_page,
+                )
+        except CollectionBusyError as e:
+            return error_response(409, str(e), data={"mp_id": mp.id})
+        except CollectionCooldownError as e:
+            return error_response(
+                429,
+                str(e),
+                data={"mp_id": mp.id, "retry_after": e.remaining},
             )
         except Exception as e:
             err = str(e)

@@ -382,15 +382,30 @@ async def collect_weread_notes(
             return False
 
     try:
-        await asyncio.to_thread(
-            wx.get_Articles,
-            faker_id=faker_id or None,
-            Mps_id=mp_id,
-            Mps_title=req.mp_name or faker_id or "微信读书",
-            CallBack=save_callback,
-            MaxPage=1,
-            interval=3,
-            Gather_Content=req.gather_content,
+        from core.wx.collection_guard import (
+            CollectionBusyError,
+            CollectionCooldownError,
+            CollectionGuard,
+        )
+        guard = CollectionGuard(mp_id or faker_id)
+        with guard.hold():
+            await asyncio.to_thread(
+                wx.get_Articles,
+                faker_id=faker_id or None,
+                Mps_id=mp_id,
+                Mps_title=req.mp_name or faker_id or "微信读书",
+                CallBack=save_callback,
+                MaxPage=1,
+                interval=3,
+                Gather_Content=req.gather_content,
+            )
+    except CollectionBusyError as exc:
+        return error_response(409, str(exc), {"mp_id": mp_id or faker_id})
+    except CollectionCooldownError as exc:
+        return error_response(
+            429,
+            str(exc),
+            {"mp_id": mp_id or faker_id, "retry_after": exc.remaining},
         )
     except WereadMPAPIError as exc:
         return error_response(400, f"采集失败: {exc}", {
