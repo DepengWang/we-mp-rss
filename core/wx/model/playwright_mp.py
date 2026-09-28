@@ -145,6 +145,7 @@ class MpsPlaywright(WxGather):
         from playwright.async_api import async_playwright
         
         all_articles = []
+        api_errors = []
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -193,18 +194,32 @@ class MpsPlaywright(WxGather):
                 captured_responses: List[Dict] = []
 
                 async def handle_response(response):
-                    """拦截所有 /cgi-bin/ 相关的响应"""
+                    """拦截 /cgi-bin/ JSON 响应，兼容不同后台端点的返回结构。"""
                     url = response.url
                     if "/cgi-bin/" not in url:
                         return
                     
                     try:
-                        body = await response.json()
+                        body = json.loads(await response.text())
                     except Exception:
                         return
 
-                    ret = body.get("base_resp", {}).get("ret", -1) if isinstance(body, dict) else -1
+                    if not isinstance(body, dict):
+                        return
+
+                    base_resp = body.get("base_resp", {}) or {}
+                    ret = base_resp.get("ret", 0)
+                    try:
+                        ret = int(ret)
+                    except (TypeError, ValueError):
+                        ret = -1
                     if ret != 0:
+                        if len(api_errors) < 3:
+                            api_errors.append({
+                                "url": url,
+                                "ret": ret,
+                                "err_msg": str(base_resp.get("err_msg", "")),
+                            })
                         return
 
                     # 检查是否包含文章数据
@@ -217,9 +232,11 @@ class MpsPlaywright(WxGather):
                                 has_articles = True
                                 data_body = body
                                 break
-                        if "publish_page" in body and isinstance(body["publish_page"], str):
+                        if "publish_page" in body:
                             try:
-                                pp = json.loads(body["publish_page"])
+                                pp = body["publish_page"]
+                                if isinstance(pp, str):
+                                    pp = json.loads(pp)
                                 if "publish_list" in pp:
                                     has_articles = True
                                     data_body = body
@@ -243,11 +260,16 @@ class MpsPlaywright(WxGather):
                     f"type=9&token={self.token}&lang=zh_CN"
                 )
 
-                print_info(f"导航到后台页面...")
-                await page.goto(published_url, wait_until="networkidle", timeout=30000)
+                async def visit(url: str, timeout: int = 30000):
+                    """以 DOM 加载为主，避免后台长连接导致 networkidle 永远不稳定。"""
+                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                    await page.wait_for_timeout(5000)
 
-                # 等待一段时间让页面加载和数据请求完成
-                await asyncio.sleep(3)
+                print_info("先建立公众号后台首页会话...")
+                await visit("https://mp.weixin.qq.com/", timeout=30000)
+
+                print_info("导航到后台已发表页面...")
+                await visit(published_url, timeout=30000)
 
                 # 如果页面要求重新登录
                 page_text = await page.content()
@@ -285,22 +307,40 @@ class MpsPlaywright(WxGather):
                     # 方式2: 直接导航到 MP 后台的已发表页面，解析 DOM
                     print_info("未拦截到 API 响应，尝试解析页面 DOM...")
                     
-                    # 尝试新版后台
-                    await page.goto(
-                        "https://mp.weixin.qq.com/", wait_until="networkidle", timeout=30000
-                    )
-                    await asyncio.sleep(2)
-                    
-                    # 再次等待数据
-                    await page.wait_for_timeout(3000)
-                    
+                    # 尝试通过页面入口触发新版后台自身的初始化请求。
+                    for text in ["已发表", "内容管理", "文章管理"]:
+                        try:
+                            locator = page.get_by_text(text, exact=True).first
+                            if await locator.count() and await locator.is_visible():
+                                await locator.click(timeout=3000)
+                                await page.wait_for_timeout(5000)
+                                if captured_responses:
+                                    break
+                        except Exception:
+                            continue
+
                     if not captured_responses:
                         print_warning("仍未能获取到数据，请检查:")
                         print_warning("  1. 公众号平台 Cookie 是否有效")
                         print_warning("  2. 公众号平台 Token 是否有效")
-                        print_warning("  3. 是否需要使用 --headed 模式手动登录")
+                        print_warning("  3. 后台页面是否已改变或要求人工验证")
+                        for error in api_errors:
+                            print_warning(
+                                f"后台接口返回 ret={error['ret']}: {error['err_msg']}"
+                            )
 
-                return all_articles if all_articles else None
+                if not all_articles:
+                    return None
+
+                unique_articles = []
+                seen_aids = set()
+                for article in all_articles:
+                    aid = article.get("aid") or article.get("id") or article.get("link")
+                    if aid in seen_aids:
+                        continue
+                    seen_aids.add(aid)
+                    unique_articles.append(article)
+                return unique_articles
 
             finally:
                 await browser.close()
@@ -402,6 +442,10 @@ class MpsPlaywright(WxGather):
                 articles.extend(raw)
             return articles
 
+        # 部分新版接口直接返回 publish_list，而不是 publish_page 包装结构。
+        if "publish_list" in body and isinstance(body["publish_list"], list):
+            return self._normalize_article_list(body["publish_list"])
+
         # 格式3: publish_page
         if "publish_page" in body:
             try:
@@ -424,4 +468,22 @@ class MpsPlaywright(WxGather):
                 print_error(f"解析 publish_page 失败: {e}")
             return articles
 
+        return articles
+
+    def _normalize_article_list(self, raw_list: list) -> List[Dict]:
+        """提取直接返回的文章列表，兼容 publish_info/appmsgex 嵌套结构。"""
+        articles = []
+        for item in raw_list:
+            if not isinstance(item, dict):
+                continue
+            publish_info = item.get("publish_info")
+            if isinstance(publish_info, str):
+                try:
+                    publish_info = json.loads(publish_info)
+                except Exception:
+                    publish_info = None
+            if isinstance(publish_info, dict) and isinstance(publish_info.get("appmsgex"), list):
+                articles.extend(publish_info["appmsgex"])
+            elif item.get("aid") or item.get("id"):
+                articles.append(item)
         return articles
