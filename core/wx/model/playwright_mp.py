@@ -184,6 +184,12 @@ class MpsPlaywright(WxGather):
 
                 # 加载已保存的 Cookie
                 cookies_to_set = self._load_browser_cookies()
+                print_info(
+                    "Playwright 会话诊断: "
+                    f"token={'已配置' if self.token else '缺失'}, "
+                    f"cookie_count={len(cookies_to_set)}, "
+                    f"storage_state={'已加载' if 'storage_state' in context_options else '未加载'}"
+                )
                 if cookies_to_set:
                     await context.add_cookies(cookies_to_set)
                     print_info(f"已加载公众号浏览器 Cookie: {len(cookies_to_set)} 项")
@@ -262,8 +268,11 @@ class MpsPlaywright(WxGather):
 
                 async def visit(url: str, timeout: int = 30000):
                     """以 DOM 加载为主，避免后台长连接导致 networkidle 永远不稳定。"""
-                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
                     await page.wait_for_timeout(5000)
+                    path = page.url.split("?", 1)[0]
+                    status = response.status if response is not None else "无响应对象"
+                    print_info(f"Playwright 页面响应: status={status}, path={path}")
 
                 print_info("先建立公众号后台首页会话...")
                 await visit("https://mp.weixin.qq.com/", timeout=30000)
@@ -273,7 +282,12 @@ class MpsPlaywright(WxGather):
 
                 # 如果页面要求重新登录
                 page_text = await page.content()
-                if "扫码登录" in page_text or "login" in page.url.lower():
+                login_required = "扫码登录" in page_text or "login" in page.url.lower()
+                print_info(
+                    "Playwright 页面状态: "
+                    f"login_required={login_required}, captured_responses={len(captured_responses)}"
+                )
+                if login_required:
                     print_error("Playwright 模式下需要重新扫码登录")
                     return None
 
@@ -289,6 +303,7 @@ class MpsPlaywright(WxGather):
                     for resp_data in captured_responses:
                         articles = self._parse_captured_response(resp_data["body"])
                         all_articles.extend(articles)
+                    print_info(f"Playwright 响应解析: raw_articles={len(all_articles)}")
                     
                     # 如果需要更多页
                     if len(all_articles) > 0 and max_page > 1:
@@ -330,6 +345,10 @@ class MpsPlaywright(WxGather):
                             )
 
                 if not all_articles:
+                    print_warning(
+                        f"Playwright 未解析到文章: captured_responses={len(captured_responses)}, "
+                        f"api_errors={len(api_errors)}"
+                    )
                     return None
 
                 unique_articles = []
@@ -340,6 +359,7 @@ class MpsPlaywright(WxGather):
                         continue
                     seen_aids.add(aid)
                     unique_articles.append(article)
+                print_info(f"Playwright 文章去重后: {len(unique_articles)} 条")
                 return unique_articles
 
             finally:
