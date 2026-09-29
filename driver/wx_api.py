@@ -671,11 +671,19 @@ class WeChatAPI:
             print_error(f"获取账号信息失败: {str(e)}")
             return None
 
-    async def switch_account(self,username:str=""):
-        """切换微信公众号账号（异步）"""
+    async def switch_account(self, account_id: str = ""):
+        """Switch to a specific account ID, or rotate by ID when omitted."""
         self.login_with_token()
-        from driver.wx import WX_API
-        return await WX_API.switch_account(username)
+        from driver.wx import WX_API as browser_api
+        if account_id:
+            return await browser_api.switch_account(account_id=account_id)
+        return await browser_api.auto_rotate_account_by_id()
+
+    async def auto_rotate_account_by_id(self):
+        """Keep the legacy API facade compatible with account-ID rotation."""
+        self.login_with_token()
+        from driver.wx import WX_API as browser_api
+        return await browser_api.auto_rotate_account_by_id()
     def _redirect(self):
         url=f"https://mp.weixin.qq.com/cgi-bin/loginpage?url=/cgi-bin/home?t=home/index&lang=zh_CN&token={self.token}"
         response=self.session.get(url)

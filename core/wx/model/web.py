@@ -25,6 +25,8 @@ class MpsWeb(WxGather):
         return ""
     # 重写 get_Articles 方法
     def get_Articles(self, faker_id:str='',Mps_id:str='',Mps_title="",CallBack=None,start_page:int=0,MaxPage:int=1,interval=10,Gather_Content=False,Item_Over_CallBack=None,Over_CallBack=None):
+        self.collection_failed = False
+        self.collection_error = ""
         super().Start(mp_id=Mps_id)
         Gather_Content = self.Gather_Content
         print(f"Web浏览器模式,是否采集[{Mps_title}]内容：{Gather_Content}\n")
@@ -70,14 +72,20 @@ class MpsWeb(WxGather):
                         print_warning(f"频率限制, 第{retry_count}次重试...")
                         time.sleep(60 * retry_count)
                         continue
+                    self.collection_failed = True
+                    self.collection_error = "Web 采集触发频率限制"
                     super().Error("frequencey control, stop at {}".format(str(begin)))
                     break
-                
+
                 if msg['base_resp']['ret'] == 200003:
+                    self.collection_failed = True
+                    self.collection_error = "Web 登录态失效"
                     super().Error("Invalid Session, stop at {}".format(str(begin)),code="Invalid Session")
                     break
                 # 处理200002错误：参数无效
                 if msg['base_resp']['ret'] == 200002:
+                    self.collection_failed = True
+                    self.collection_error = "Web 采集参数无效"
                     super().Error("Invalid arguments, stop at {}".format(str(begin)), code="Invalid Arguments")
                     # 设置feed状态为0并继续下一个任务
                     self._set_feed_status(Mps_id, 0)
@@ -86,6 +94,8 @@ class MpsWeb(WxGather):
                     super().Over(CallBack=Over_CallBack)
                     return
                 if msg['base_resp']['ret'] != 0:
+                    self.collection_failed = True
+                    self.collection_error = f"Web 接口返回错误: {msg['base_resp'].get('err_msg', '')}"
                     # 检测是否因为接口被限制，尝试降级到 free_publish
                     err_msg = msg['base_resp'].get('err_msg','')
                     print_warning(f"appmsgpublish 返回错误(ret={msg['base_resp']['ret']}): {err_msg}")
@@ -126,9 +136,13 @@ class MpsWeb(WxGather):
                 # 翻页
                 i += 1
             except requests.exceptions.Timeout:
+                self.collection_failed = True
+                self.collection_error = "Web 请求超时"
                 print("Request timed out")
                 break
             except requests.exceptions.RequestException as e:
+                self.collection_failed = True
+                self.collection_error = f"Web 请求异常: {e}"
                 print(f"Request error: {e}")
                 break
             finally:

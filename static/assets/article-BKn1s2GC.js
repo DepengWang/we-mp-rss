@@ -1,0 +1,1 @@
+import{v as e}from"./http-ADhUjrNS.js";export{e as getArticles};

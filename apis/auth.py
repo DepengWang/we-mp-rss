@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from datetime import timedelta
+import time
 from core.auth import (
     authenticate_user,
     create_access_token,
@@ -426,17 +427,224 @@ async def reset_password(req: ResetPasswordRequest):
         )
 
 
+@router.get("/accounts/status", summary="获取公众号账号与Token有效期")
+async def wx_account_status(current_user: dict = Depends(get_current_user)):
+    """Return cached account summaries and the currently active account, without secrets."""
+    from driver.token import get_account_sessions_data, get_account_status_data, _get_token_data
+
+    cached = get_account_status_data()
+    sessions = get_account_sessions_data()
+    token_data = _get_token_data() or {}
+    ext_data = token_data.get("ext_data") or {}
+    current_name = str(ext_data.get("wx_app_name") or "").strip()
+    current_expiry = token_data.get("expiry") or {}
+    accounts = [dict(item) for item in cached.get("accounts", []) if isinstance(item, dict)]
+    active_account_id = str(cached.get("active_account_id") or "")
+
+    # Include any previously saved account session even if the lightweight
+    # status summary was written by an older version or has not been refreshed.
+    known_ids = {str(item.get("account_id") or "") for item in accounts}
+    for account_id, session in sessions.items():
+        account_id = str(account_id or "")
+        session = session or {}
+        if not account_id or account_id in known_ids:
+            continue
+        expiry = session.get("expiry") or {}
+        try:
+            token_status = "valid" if float(expiry.get("expiry_timestamp")) > time.time() else "expired"
+        except (TypeError, ValueError):
+            token_status = "unknown"
+        accounts.append({
+            "account_id": account_id,
+            "name": str(session.get("name") or "未命名公众号"),
+            "token_status": token_status,
+            "expiry": {
+                "expiry_timestamp": expiry.get("expiry_timestamp"),
+                "expiry_time": str(expiry.get("expiry_time") or ""),
+            },
+            "ext_data": session.get("ext_data") or {},
+            "checked_at": str(session.get("updated_at") or ""),
+        })
+
+    active_matches = [item for item in accounts if current_name and item.get("name") == current_name]
+    cached_active_matches = [
+        item for item in accounts
+        if active_account_id and item.get("account_id") == active_account_id
+    ]
+    if (
+        len(active_matches) > 1
+        and len(cached_active_matches) == 1
+        and cached_active_matches[0].get("name") == current_name
+    ):
+        active_matches = cached_active_matches
+    if len(active_matches) == 1:
+        active_account_id = str(active_matches[0].get("account_id") or "")
+        active_matches[0]["expiry"] = {
+            "expiry_timestamp": current_expiry.get("expiry_timestamp"),
+            "expiry_time": str(current_expiry.get("expiry_time") or ""),
+        }
+        expiry_timestamp = current_expiry.get("expiry_timestamp")
+        if expiry_timestamp is not None:
+            try:
+                is_valid = float(expiry_timestamp) > time.time()
+            except (TypeError, ValueError):
+                is_valid = False
+            active_matches[0]["token_status"] = (
+                "valid" if token_data.get("token") and is_valid else "expired"
+            )
+        else:
+            active_matches[0]["token_status"] = "unknown"
+    elif current_name:
+        # A manually changed backend account can differ from the cached active ID.
+        # Keep it visible as the active session instead of marking a stale cached row.
+        active_account_id = ""
+        accounts.append({
+            "account_id": "",
+            "name": current_name,
+            "token_status": "unknown",
+            "expiry": {
+                "expiry_timestamp": current_expiry.get("expiry_timestamp"),
+                "expiry_time": str(current_expiry.get("expiry_time") or ""),
+            },
+            "checked_at": "",
+        })
+        expiry_timestamp = current_expiry.get("expiry_timestamp")
+        if expiry_timestamp is not None:
+            try:
+                is_valid = float(expiry_timestamp) > time.time()
+            except (TypeError, ValueError):
+                is_valid = False
+            accounts[-1]["token_status"] = (
+                "valid" if token_data.get("token") and is_valid else "expired"
+            )
+    else:
+        active_account_id = ""
+
+    now = time.time()
+    for item in accounts:
+        session = sessions.get(str(item.get("account_id") or ""), {}) or {}
+        item["has_saved_session"] = bool(session.get("token") and session.get("cookies"))
+        item["session_updated_at"] = str(session.get("updated_at") or "")
+        expiry = item.get("expiry") or {}
+        timestamp = expiry.get("expiry_timestamp")
+        try:
+            remaining = max(0, int(float(timestamp) - now)) if timestamp is not None else None
+        except (TypeError, ValueError):
+            remaining = None
+        expiry["remaining_seconds"] = remaining
+        item["expiry"] = expiry
+        if remaining == 0 and item.get("token_status") == "valid":
+            item["token_status"] = "expired"
+        item["is_active"] = bool(
+            (active_account_id and item.get("account_id") == active_account_id)
+            or (
+                not active_account_id
+                and current_name
+                and item.get("name") == current_name
+                and not item.get("account_id")
+            )
+        )
+
+    gather_model = str(cfg.get("gather.model") or "web").lower()
+    uses_active_account = gather_model not in {"weread", "weread_mp"}
+    for item in accounts:
+        item["collector_associated"] = bool(item["is_active"] and uses_active_account)
+
+    return success_response({
+        "accounts": accounts,
+        "active_account_id": active_account_id,
+        "checked_at": str(cached.get("checked_at") or ""),
+        "cached": bool(cached.get("checked_at")),
+        "collector_mode": gather_model,
+        "uses_active_account": uses_active_account,
+    })
+
+
+@router.get("/accounts/{account_id}/token", summary="按需查看指定公众号 Token")
+async def wx_account_token(
+    account_id: str,
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return one cached token on explicit request; never expose its cookies."""
+    from driver.token import get_account_session_data
+
+    response.headers["Cache-Control"] = "no-store"
+    account = get_account_session_data(account_id)
+    token = str(account.get("token") or "")
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=error_response(code=40404, message="该账号没有已缓存的 Token；请先刷新账号状态"),
+        )
+    return success_response({
+        "account_id": str(account.get("account_id") or account_id),
+        "name": str(account.get("name") or ""),
+        "token": token,
+        "expiry": account.get("expiry") or {},
+        "ext_data": account.get("ext_data") or {},
+        "updated_at": str(account.get("updated_at") or ""),
+    })
+
+
+@router.post("/accounts/refresh", summary="手动刷新公众号账号状态（异步任务）")
+async def refresh_wx_account_status(current_user: dict = Depends(get_current_user)):
+    """Inspect account expiry metadata in the background, then restore the active account."""
+    import asyncio
+    import threading
+
+    user_id = current_user.get("sub") or current_user.get("username") or current_user.get("id") or "unknown"
+    manager = get_switch_job_manager()
+    job = manager.create_job(user_id=str(user_id), target_username="__refresh_account_status__")
+    manager.update(job.job_id, stage="queued", message="已入队，准备刷新公众号账号状态", progress=0)
+
+    def _run_in_thread():
+        def _target():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                import sys
+                if sys.platform == "win32":
+                    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+                try:
+                    def progress_callback(stage: str, message: str, progress: int) -> None:
+                        manager.update(job.job_id, stage=stage, message=message, progress=progress)
+                    from driver.wx import WX_API as WX_BROWSER_API
+                    result = loop.run_until_complete(
+                        WX_BROWSER_API.refresh_account_status(progress_callback=progress_callback)
+                    )
+                    current_job = manager.get_job(job.job_id)
+                    failure_message = (
+                        current_job.message if current_job and current_job.message
+                        else "刷新失败，请查看任务进度与日志"
+                    )
+                    manager.finish(
+                        job.job_id,
+                        ok=bool(result),
+                        message=("公众号账号状态已刷新" if result else failure_message),
+                    )
+                finally:
+                    loop.close()
+            except Exception as e:
+                manager.finish(job.job_id, ok=False, message=f"刷新任务异常: {e}")
+
+        threading.Thread(target=_target, daemon=True).start()
+
+    _run_in_thread()
+    return success_response(job.to_dict(), "账号状态刷新任务已启动")
+
+
 @router.post("/switch", summary="切换微信账号（异步任务）")
 async def switch_wechat_account(
     current_user: dict = Depends(get_current_user),
-    username: str = "",
+    account_id: str = Query(..., min_length=1),
 ):
     """
-    异步触发切换微信公众号账号，立即返回 job_id。
+    按后台账号列表中的 account_id 切换公众号，立即返回 job_id。
 
     用法示例：
     ```
-    POST /api/v1/auth/switch?username=
+    POST /api/v1/auth/switch?account_id=<account_id>
     Authorization: Bearer {token}
 
     # 轮询进度
@@ -455,8 +663,14 @@ async def switch_wechat_account(
     import asyncio
     user_id = current_user.get("sub") or current_user.get("username") or current_user.get("id") or "unknown"
     manager = get_switch_job_manager()
-    job = manager.create_job(user_id=str(user_id), target_username=username)
-    manager.update(job.job_id, stage="queued", message="已入队，准备启动切换任务", progress=0)
+    account_id = account_id.strip()
+    if not account_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_response(code=40001, message="必须指定目标公众号 account_id"),
+        )
+    job = manager.create_job(user_id=str(user_id), target_username=account_id)
+    manager.update(job.job_id, stage="queued", message=f"已入队，准备切换到账号 {account_id}", progress=0)
 
     def _run_in_thread() -> None:
         """在新线程中跑同步包装，确保 HTTP 立即返回。"""
@@ -472,10 +686,16 @@ async def switch_wechat_account(
                 try:
                     def progress_callback(stage: str, message: str, progress: int) -> None:
                         manager.update(job.job_id, stage=stage, message=message, progress=progress)
+                    from driver.wx import WX_API as WX_BROWSER_API
                     result = loop.run_until_complete(
-                        WX_API.switch_account(username=username, progress_callback=progress_callback)
+                        WX_BROWSER_API.switch_account(account_id=account_id, progress_callback=progress_callback)
                     )
-                    manager.finish(job.job_id, ok=bool(result), message=("切换成功" if result else "切换失败，详情请查看日志"))
+                    current_job = manager.get_job(job.job_id)
+                    result_message = (
+                        current_job.message if current_job and current_job.message
+                        else ("账号切换成功" if result else "切换失败，请查看服务日志")
+                    )
+                    manager.finish(job.job_id, ok=bool(result), message=result_message)
                 finally:
                     try:
                         loop.close()

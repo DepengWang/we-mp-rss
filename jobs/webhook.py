@@ -3,7 +3,7 @@ from core.models.feed import Feed
 from core.models.article import Article
 from core.print import print_success
 from core.notice import notice
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from core.lax import TemplateParser
 from datetime import datetime
 from core.log import logger
@@ -14,9 +14,57 @@ import re
 @dataclass
 class MessageWebHook:
     task: MessageTask
-    feed:Feed
-    articles: list[Article]
+    feed: Feed = None
+    articles: list[Article] = field(default_factory=list)
+    # 任务完成后的汇总结果。每一项包含 feed、articles、success、error、status_color 等字段。
+    results: list[dict] = field(default_factory=list)
+    summary: dict = field(default_factory=dict)
     pass
+
+
+def _article_to_dict(article):
+    """将 Article 或字典转换为模板可用的字典。"""
+    if isinstance(article, dict):
+        return {
+            field.name: article.get(field.name, "")
+            for field in Article.__table__.columns
+        }
+    return {
+        field.name: getattr(article, field.name, "")
+        for field in Article.__table__.columns
+    }
+
+
+def _build_summary(results: list[dict]) -> dict:
+    """构造汇总模板变量。"""
+    return {
+        "total": len(results),
+        "successful": sum(1 for item in results if item.get("success")),
+        "failed": sum(1 for item in results if not item.get("success")),
+        "new_articles": sum(len(item.get("articles") or []) for item in results),
+    }
+
+
+def _flatten_results(results: list[dict]) -> tuple[list[dict], list[dict]]:
+    """为消息模板提供不需要嵌套循环的文章和失败列表。"""
+    new_articles = []
+    failures = []
+    for result in results:
+        feed = result.get("feed")
+        feed_name = result.get("mp_name") or getattr(feed, "mp_name", "")
+        if result.get("success"):
+            for article in result.get("articles") or []:
+                item = _article_to_dict(article)
+                item["feed_name"] = feed_name
+                item["status_color"] = "info"
+                new_articles.append(item)
+        else:
+            failures.append({
+                "feed_name": feed_name,
+                "error": result.get("error") or "采集失败",
+                "status_color": "warning",
+            })
+    return new_articles, failures
 
 def send_message(hook: MessageWebHook) -> str:
     """
@@ -28,7 +76,18 @@ def send_message(hook: MessageWebHook) -> str:
     返回:
         str: 格式化后的消息内容
     """
-    template = hook.task.message_template if hook.task.message_template else """
+    if hook.results and not hook.task.message_template:
+        template = """### {{ task.name }}
+> 执行时间：{{ now }}
+> 结果：成功 {{ summary.successful }} 个，失败 {{ summary.failed }} 个，新增 {{ summary.new_articles }} 篇
+{% for article in new_articles %}
+- <font color=\"{{ article.status_color }}\">[{{ article.feed_name }}] {{ article.title }}</font>：{{ article.url }}
+{% endfor %}
+{% for failure in failures %}
+- <font color=\"{{ failure.status_color }}\">[{{ failure.feed_name }}] 采集失败：{{ failure.error }}</font>
+{% endfor %}"""
+    else:
+        template = hook.task.message_template if hook.task.message_template else """
 ### {{feed.mp_name}} 订阅消息：
 {% if articles %}
 {% for article in articles %}
@@ -39,12 +98,27 @@ def send_message(hook: MessageWebHook) -> str:
 {% endif %}
     """
     parser = TemplateParser(template)
+    processed_results = []
+    if hook.results:
+        for result in hook.results:
+            item = dict(result)
+            item["articles"] = [
+                _article_to_dict(article)
+                for article in (result.get("articles") or [])
+            ]
+            processed_results.append(item)
+
     data = {
         "feed": hook.feed,
         "articles": hook.articles,
         "task": hook.task,
-        'now': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        'now': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "results": processed_results,
+        "feeds": processed_results,
+        "summary": hook.summary or (_build_summary(processed_results) if hook.results else {}),
     }
+    if hook.results:
+        data["new_articles"], data["failures"] = _flatten_results(processed_results)
     message = parser.render(data)
     # 这里可以添加发送消息的具体实现
     print("发送消息:", message)
@@ -69,7 +143,42 @@ def call_webhook(hook: MessageWebHook, is_test: bool = False) -> str:
     异常:
         ValueError: 当webhook调用失败时抛出
     """
-    template = hook.task.message_template if hook.task.message_template else """{
+    if hook.results:
+        default_template = """{
+  "task": {
+    "id": "{{ task.id }}",
+    "name": "{{ task.name }}",
+    "time": "{{ now }}"
+  },
+  "summary": {
+    "total": {{ summary.total }},
+    "successful": {{ summary.successful }},
+    "failed": {{ summary.failed }},
+    "new_articles": {{ summary.new_articles }}
+  },
+  "articles": [
+    {% for article in new_articles %}
+    {
+      "feed_name": "{{ article.feed_name }}",
+      "title": "{{ article.title }}",
+      "url": "{{ article.url }}",
+      "publish_time": "{{ article.publish_time }}",
+      "status_color": "{{ article.status_color }}"
+    }{% if not loop.last %},{% endif %}
+    {% endfor %}
+  ],
+  "failures": [
+    {% for failure in failures %}
+    {
+      "feed_name": "{{ failure.feed_name }}",
+      "error": "{{ failure.error }}",
+      "status_color": "{{ failure.status_color }}"
+    }{% if not loop.last %},{% endif %}
+    {% endfor %}
+  ]
+}"""
+    else:
+        default_template = """{
   "feed": {
     "id": "{{ feed.id }}",
     "name": "{{ feed.mp_name }}"
@@ -96,6 +205,7 @@ def call_webhook(hook: MessageWebHook, is_test: bool = False) -> str:
   "now": "{{ now }}"
 }
 """
+    template = hook.task.message_template if hook.task.message_template else default_template
 
     # 检查template是否需要content
     template_needs_content = "content" in template.lower()
@@ -131,12 +241,32 @@ def call_webhook(hook: MessageWebHook, is_test: bool = False) -> str:
             else:
                 processed_articles.append(article)
 
+    processed_results = []
+    if hook.results:
+        for result in hook.results:
+            item = dict(result)
+            item["articles"] = [
+                _article_to_dict(article)
+                for article in (result.get("articles") or [])
+            ]
+            processed_results.append(item)
+        processed_articles = [
+            article
+            for result in processed_results
+            for article in result["articles"]
+        ]
+
     data = {
         "feed": hook.feed,
         "articles": processed_articles,
         "task": hook.task,
-        "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "results": processed_results,
+        "feeds": processed_results,
+        "summary": hook.summary or (_build_summary(processed_results) if hook.results else {}),
     }
+    if hook.results:
+        data["new_articles"], data["failures"] = _flatten_results(processed_results)
 
    # 预处理content字段
     import json
@@ -218,6 +348,17 @@ def web_hook(hook:MessageWebHook, is_test:bool = False):
         ValueError: 当消息类型未知时抛出
     """
     try:
+        # 汇总任务允许只包含失败项；成功但无新文章的订阅源已经在追踪器中剔除。
+        if hook.results:
+            if not any(item.get("articles") or not item.get("success") for item in hook.results):
+                logger.info("任务没有新文章且没有采集失败，不发送Webhook")
+                return
+            if hook.task.message_type == 0:
+                return send_message(hook)
+            if hook.task.message_type == 1:
+                return call_webhook(hook, is_test)
+            raise ValueError(f"未知的消息类型: {hook.task.message_type}")
+
         # 处理articles参数，兼容Article对象和字典类型
         processed_articles = []
         if len(hook.articles)<=0:

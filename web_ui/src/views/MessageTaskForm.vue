@@ -159,16 +159,17 @@ onMounted(() => {
               <a-button v-else
                 type="outline"
                 style="margin-top: 8px"
-                @click="formData.message_template = `{
-    'articles': [
-    {% for article in articles %}
-    {{article}}
-    {% if not loop.last %},{% endif %}
-    {% endfor %}
-    ]
-}`">
+                @click='formData.message_template = `### {{ task.name }}
+> 执行时间：{{ now }}
+> 结果：成功 {{ summary.successful }} 个，失败 {{ summary.failed }} 个，新增 {{ summary.new_articles }} 篇
+{% for article in new_articles %}
+- <font color="{{ article.status_color }}">[{{ article.feed_name }}] {{ article.title }}</font>：{{ article.url }}
+{% endfor %}
+{% for failure in failures %}
+- <font color="{{ failure.status_color }}">[{{ failure.feed_name }}] 采集失败：{{ failure.error }}</font>
+{% endfor %}`'>
 
-                使用示例WebHook模板
+                使用汇总WebHook模板
               </a-button>
             </a-form-item>
 
