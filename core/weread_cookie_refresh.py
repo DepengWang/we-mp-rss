@@ -1,11 +1,10 @@
-"""微信读书 Cookie 刷新（全部在宿主机执行，容器只消费结果）。
+"""微信读书 Cookie 管理：扫码授权写入，容器内线程定期无头保活/尝试轮换。
 
-架构：微信读书登录态 profile 由 macOS 钥匙串加密，容器内 Linux Chromium 解密不了，
-因此**所有浏览器操作（首次扫码 + 每日自动刷新）都在宿主机用本机 Chrome 完成**，
-刷新成功后把明文 Cookie 写回数据卷的 wx.lic；容器（jobs/mps.add_job）只读取 wx.lic
-的 Cookie 同步文章，不在容器内启动浏览器。
+主服务启动后，线程使用容器内 Playwright Chromium 访问配置的公众号主页，
+验证登录态并在服务端轮换 Cookie 时写回 wx.lic。Cookie 已失效且无法无头恢复时，
+不会覆盖现有值，需要通过管理页扫码重新授权。
 
-调用方：scripts/refresh_weread_cookie.py（GUI 扫码 / --headless 每日自动，由 launchd 触发）。
+scripts/refresh_weread_cookie.py 仍可用于手动执行浏览器刷新。
 
 流程：
 1. 用本机 Chrome（Playwright 驱动）打开配置的公众号主页 URL（reader 页，形如
@@ -26,6 +25,8 @@
 import os
 import json
 import time
+import threading
+import tempfile
 
 import yaml
 
@@ -34,6 +35,8 @@ DEFAULT_PROFILE_DIR = os.environ.get(
     "WEREAD_PROFILE_DIR",
     os.path.expanduser("~/.cache/we-mp-rss/weread-chrome-profile"),
 )
+_refresh_thread_lock = threading.Lock()
+_refresh_thread_started = False
 
 
 def _read_lic(lic_path: str = DEFAULT_LIC_PATH) -> dict:
@@ -45,8 +48,20 @@ def _read_lic(lic_path: str = DEFAULT_LIC_PATH) -> dict:
 
 
 def _write_lic(lic_path: str, doc: dict):
-    with open(lic_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(doc, f, allow_unicode=True, sort_keys=False)
+    lic_dir = os.path.dirname(os.path.abspath(lic_path))
+    os.makedirs(lic_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(lic_path)}.", suffix=".tmp", dir=lic_dir
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(doc, f, allow_unicode=True, sort_keys=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, lic_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def _load_weread_data(lic_path: str = DEFAULT_LIC_PATH):
@@ -79,6 +94,31 @@ def _save_cookie(cookie: str, name: str = "", lic_path: str = DEFAULT_LIC_PATH):
     _write_lic(lic_path, doc)
 
 
+def _cookie_signature(cookie: str):
+    """生成不含 Cookie 明文的稳定比较值，忽略 Cookie 项顺序。"""
+    pairs = []
+    for item in _dedupe_cookie(cookie).split(";"):
+        if "=" in item:
+            key, value = item.split("=", 1)
+            pairs.append((key.strip(), value.strip()))
+    return tuple(sorted(pairs))
+
+
+def _save_cookie_if_changed(cookie: str, previous_cookie: str, name: str = "",
+                            lic_path: str = DEFAULT_LIC_PATH) -> bool:
+    """仅在服务端轮换且文件未被扫码流程更新时写回。"""
+    _, current_data = _load_weread_data(lic_path)
+    current_cookie = (current_data.get("cookie") or "").strip()
+    current_signature = _cookie_signature(current_cookie)
+    if _cookie_signature(cookie) == current_signature:
+        return False
+    # 浏览器访问期间可能刚好完成了新的扫码授权；不要用旧请求结果覆盖它。
+    if current_signature != _cookie_signature(previous_cookie):
+        return False
+    _save_cookie(cookie, name=name, lic_path=lic_path)
+    return True
+
+
 def extract_vid(cookie: str) -> str:
     """从 Cookie 字符串中提取 wr_vid。"""
     for item in (cookie or "").split(";"):
@@ -104,22 +144,22 @@ def _dedupe_cookie(cookie: str) -> str:
     return "; ".join(kept.values())
 
 
-def _verify_cookie(cookie: str) -> bool:
-    """实打实请求一次 weread MP 接口，确认 Cookie 真能拉到数据。
+def _cookie_status(cookie: str) -> str:
+    """检查 Cookie 登录态，返回 ``valid``、``invalid`` 或 ``unknown``。
 
-    仅检查 'wr_vid=' 不够：过期 Cookie 同样带 wr_vid，服务端会以 -2012/-2041 等拒绝。
-    故刷新后必须用真实接口验证，避免把过期 Cookie 误判为有效（假阳性）。
-    判定标准：响应 JSON 含非零 errCode（如 -2012 登录超时、-2041 等）即视为无效。
-    无 requests 时退化为 True（不阻断），但宿主机场景应装有 requests。
+    仅检查 'wr_vid=' 不够：过期 Cookie 同样带 wr_vid。这里与管理页“测试连接”
+    使用同一个 /web/shelf/sync 接口，避免公众号文章
+    列表接口对特定 bookId 限制导致 Cookie 被误判为失效。网络错误或无法识别的
+    响应返回 unknown，避免把临时故障误报成需要扫码。
     """
     try:
         import requests
     except ImportError:
-        return True
+        return "unknown"
     try:
         r = requests.get(
-            "https://weread.qq.com/web/mp/articles",
-            params={"bookId": "MP_WXS_3528995129", "offset": 0},
+            "https://weread.qq.com/web/shelf/sync",
+            params={"userVid": "", "synckey": 0, "lectureSynckey": 0},
             headers={
                 "Cookie": cookie,
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
@@ -129,24 +169,74 @@ def _verify_cookie(cookie: str) -> bool:
             },
             timeout=30,
         )
+        if r.status_code == 401:
+            return "invalid"
+        if r.status_code != 200:
+            return "unknown"
         try:
             j = r.json()
         except Exception:
-            return False
+            return "unknown"
         if isinstance(j, dict):
             code = j.get("errCode", j.get("errcode", 0))
-            if code:  # 任何非零 errCode 均表示无效（含 -2012/-2041 等）
-                return False
-            # 有实际数据字段才视为有效
-            if "reviews" in j or "articles" in j or "synckey" in j or j.get("bookId"):
-                return True
-        return False
+            try:
+                code = int(code or 0)
+            except (TypeError, ValueError):
+                return "unknown"
+            if code in (-2012, -2010):
+                return "invalid"
+            if code == -2041:
+                # -2041 也可能表示请求被限流/拦截，只有错误文案明确指向
+                # 登录认证失效时才通知扫码，避免把采集限流误当成 Cookie 过期。
+                message = " ".join(str(j.get(key, "")) for key in (
+                    "errMsg", "errmsg", "errlog"
+                )).lower()
+                auth_markers = ("login", "expired", "登录", "超时", "过期", "失效", "鉴权", "认证")
+                if any(marker in message for marker in auth_markers):
+                    return "invalid"
+                return "unknown"
+            if code:
+                return "unknown"
+            # 书架为空也代表认证成功，因此只要求响应是书架数据结构。
+            if "books" in j or "synckey" in j:
+                return "valid"
+        return "unknown"
     except Exception:
-        return False
+        return "unknown"
+
+
+def _verify_cookie(cookie: str) -> bool:
+    """实打实请求一次微信读书书架接口，确认 Cookie 真能使用。
+
+    无 requests 时沿用旧行为，不阻断浏览器刷新；其他无法确认的情况按验证失败处理。
+    """
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        return True
+    return _cookie_status(cookie) == "valid"
+
+
+def _send_cookie_expired_notice():
+    """通过后台配置的通知渠道提示用户重新扫码，不包含 Cookie 内容。"""
+    from jobs.notice import sys_notice
+
+    sys_notice(
+        title="微信读书 Cookie 已失效",
+        tag="微信读书授权",
+        text=(
+            "无头浏览器自动刷新未能恢复登录态，且已确认当前 Cookie 失效。\n"
+            "请登录 WeRSS 后台，进入「微信读书管理」重新扫码授权。"
+        ),
+    )
 
 
 def _extract_cookie_from_page(page, context, url: str) -> str:
-    """优先从 /web/mp/articles 请求头取 Cookie，回退 context.cookies 拼接。"""
+    """访问完成后优先读取浏览器 Cookie jar，回退到请求头中的 Cookie。
+
+    请求头记录的是请求发出时的旧值；页面响应若通过 Set-Cookie 轮换登录态，
+    必须读取响应后的 context Cookie jar 才能拿到新值。
+    """
     captured = {}
 
     def _on_request(request):
@@ -158,16 +248,17 @@ def _extract_cookie_from_page(page, context, url: str) -> str:
         page.goto(url, wait_until="networkidle", timeout=60000)
     except Exception as e:
         print(f"[refresh] 打开页面异常: {e}")
-    # 优先使用 network 请求头中的 Cookie
-    cookie = captured.get("cookie", "").strip()
-    if cookie:
-        return cookie
-    # 回退：直接用 context 的 cookie jar 拼接
+    # 先读导航完成后的 Cookie jar，以便捕获响应中 Set-Cookie 更新的值。
     try:
         cookies = context.cookies("https://weread.qq.com")
-        return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+        jar_cookie = _dedupe_cookie(
+            "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+        )
+        if jar_cookie:
+            return jar_cookie
     except Exception:
-        return ""
+        pass
+    return _dedupe_cookie(captured.get("cookie", "").strip())
 
 
 def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
@@ -306,9 +397,11 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
     # 必须实打实验证 Cookie 真能拉到数据，避免把过期 Cookie 误判为有效（假阳性）
     if cookie and "wr_vid=" in cookie and _verify_cookie(cookie):
         vid = extract_vid(cookie)
-        _save_cookie(cookie, name=data.get("name", ""))
-        if verbose:
-            print(f"[refresh] Cookie 已自动更新 (vid={vid})")
+        if _save_cookie_if_changed(cookie, data.get("cookie", ""), name=data.get("name", "")):
+            if verbose:
+                print(f"[refresh] Cookie 已自动轮换并保存 (vid={vid})")
+        elif verbose:
+            print("[refresh] Cookie 仍有效，但服务端未轮换新值；未重复写入")
         return True
 
     # 2) 未拿到有效 Cookie（或拿到但验证失败＝过期）
@@ -326,9 +419,11 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
                  force_bundled=force_bundled, seed_cookie=seed_cookie)
     if cookie and "wr_vid=" in cookie and _verify_cookie(cookie):
         vid = extract_vid(cookie)
-        _save_cookie(cookie, name=data.get("name", ""))
-        if verbose:
-            print(f"[refresh] 扫码登录后 Cookie 已更新 (vid={vid})")
+        if _save_cookie_if_changed(cookie, data.get("cookie", ""), name=data.get("name", "")):
+            if verbose:
+                print(f"[refresh] 扫码登录后 Cookie 已轮换并保存 (vid={vid})")
+        elif verbose:
+            print("[refresh] 扫码登录后 Cookie 仍有效且未变化；未重复写入")
         return True
 
     if verbose:
@@ -386,6 +481,76 @@ def request_host_refresh(timeout_s: int = 180) -> dict:
             "needs_scan": False,
             "message": f"调用宿主机刷新代理失败: {e}",
         }
+
+
+def start_weread_cookie_refresh_thread(interval_hours: float = 0.5) -> bool:
+    """在当前 RSS 进程内启动 Cookie 保活线程。
+
+    线程只在 wx.lic 配置了 cookie_refresh_url 后执行：每个周期都用容器内
+    Playwright Chromium 无头访问页面，尝试捕获服务端轮换后的 Cookie，并经真实
+    接口验证后写回 wx.lic。未轮换时不重复写文件；失效且无法无头恢复时提示扫码。
+    刷新失败只记录日志，不阻塞 RSS 主服务。
+    """
+    global _refresh_thread_started
+    with _refresh_thread_lock:
+        if _refresh_thread_started:
+            return True
+        _refresh_thread_started = True
+
+    stop_event = threading.Event()
+
+    def _worker():
+        interval_seconds = max(float(interval_hours) * 3600, 300)
+        expired_notice_sent = False
+        while not stop_event.is_set():
+            try:
+                _, data = _load_weread_data()
+                url = (data.get("cookie_refresh_url") or "").strip()
+                if url:
+                    ok = refresh_weread_cookie(
+                        verbose=True,
+                        headless_only=True,
+                        force_bundled=True,
+                        cooldown_hours=0,
+                    )
+                    if ok:
+                        expired_notice_sent = False
+                    else:
+                        # 刷新尝试失败本身不代表 Cookie 失效。重新读取 wx.lic，
+                        # 再用书架接口确认，避免把网络/浏览器故障误报为需要扫码。
+                        _, latest_data = _load_weread_data()
+                        current_cookie = (latest_data.get("cookie") or "").strip()
+                        cookie_status = (
+                            _cookie_status(current_cookie) if current_cookie else "unknown"
+                        )
+                        if cookie_status == "invalid":
+                            print("[refresh] Cookie 已确认失效，无头刷新未恢复登录态")
+                            if not expired_notice_sent:
+                                try:
+                                    _send_cookie_expired_notice()
+                                    expired_notice_sent = True
+                                    print("[refresh] 已通过配置的通知渠道提醒重新扫码")
+                                except Exception as e:
+                                    print(f"[refresh] 发送扫码提醒失败: {e}")
+                        elif cookie_status == "valid":
+                            # 若用户已在后台重新扫码，下一次失效时可以再次提醒。
+                            expired_notice_sent = False
+                            print("[refresh] 自动刷新未完成，但现有 Cookie 仍有效")
+                        else:
+                            print("[refresh] 自动刷新未完成，Cookie 状态无法确认")
+                else:
+                    print("[refresh] 未配置 cookie_refresh_url，自动刷新线程等待配置")
+            except Exception as e:
+                print(f"[refresh] 自动刷新线程异常（不影响 RSS 服务）: {e}")
+            stop_event.wait(interval_seconds)
+
+    thread = threading.Thread(
+        target=_worker,
+        name="weread-cookie-refresh",
+        daemon=True,
+    )
+    thread.start()
+    return True
 
 
 if __name__ == "__main__":

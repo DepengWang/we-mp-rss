@@ -23,6 +23,11 @@ if __name__ == '__main__':
         import init_sys as init
         init.init()
     start_auth_service()
+    try:
+        from core.weread_cookie_refresh import start_weread_cookie_refresh_thread
+        start_weread_cookie_refresh_thread()
+    except Exception as e:
+        print_warning(f"启动微信读书 Cookie 自动刷新线程失败: {e}")
     # 启动级联同步服务（如果配置为子节点）
     cascade_service_started = False
     if cfg.get("cascade.enabled", False) and cfg.get("cascade.node_type") == "child":
