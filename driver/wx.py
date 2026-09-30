@@ -534,14 +534,58 @@ class Wx:
             else:
                 raise RuntimeError("等待采集任务结束超时；本次未启动扫码，当前授权未覆盖")
 
-            from driver.success import getStatus, setStatus
-            if not getStatus():
-                # Expiry was not past; let Token() perform the real platform validation.
-                setStatus(True)
-            restored = await self.Token(isClose=False)
-            if not restored or not self._haslogin:
-                raise RuntimeError("无法验证并保全当前公众号会话；本次未启动扫码，原授权未覆盖")
+            # Do not use Token() here: its legacy #jumpUrl selector is no longer
+            # present on the current WeChat admin page, so it rejects a perfectly
+            # usable session before the QR flow can start. Restore the current
+            # browser session directly and verify the account through the account
+            # switcher before saving it.
+            from urllib.parse import quote
+
+            cookies = []
+            if isinstance(self.SESSION, dict) and self.SESSION.get("token") == token:
+                cookies = self.SESSION.get("cookies") or []
+            if not cookies:
+                try:
+                    stored = Store.load()
+                    cookies = stored if isinstance(stored, list) else []
+                except Exception:
+                    cookies = []
+            if not cookies:
+                raise RuntimeError("当前公众号 Cookie 不可用；本次未启动扫码，原授权未覆盖")
+
+            normalized_cookies = []
+            for cookie in cookies:
+                if not isinstance(cookie, dict):
+                    continue
+                normalized = dict(cookie)
+                normalized.setdefault("domain", "mp.weixin.qq.com")
+                normalized.setdefault("path", "/")
+                normalized_cookies.append(normalized)
+            if not normalized_cookies:
+                raise RuntimeError("当前公众号 Cookie 格式无效；本次未启动扫码，原授权未覆盖")
+
+            if not self.controller.is_browser_started() or not self.controller.is_page_valid():
+                await self.controller.start_browser()
+            await self.controller.add_cookies(normalized_cookies)
+            home_url = (
+                f"{self.WX_HOME}?t=home/index&lang=zh_CN&token={quote(token, safe='')}"
+            )
+            if not await self.controller.open_url(home_url):
+                raise RuntimeError("当前公众号页面加载失败；本次未启动扫码，原授权未覆盖")
+
+            page = self.controller.page
+            page_url = str(page.url or "").lower()
+            login_prompt = page.locator("body:has-text('使用账号登录')")
+            if "login" in page_url or await login_prompt.count() > 0:
+                raise RuntimeError("当前公众号 Cookie 已失效；本次未启动扫码，原授权未覆盖")
+
+            live_data = await self._extract_wechat_data()
+            live_name = str((live_data or {}).get("wx_app_name") or "").strip()
+            if not live_name or (current_name and live_name != current_name):
+                raise RuntimeError("恢复后的公众号名称与原账号不一致；本次未启动扫码，原授权未覆盖")
+
             target = await self._record_live_account_session(newly_authorized=False, active=True)
+            self._haslogin = True
             print_success(f"扫码前已保全当前公众号会话：{target['name']}（{target['account_id']}）")
             return True
         finally:
