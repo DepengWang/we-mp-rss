@@ -293,6 +293,8 @@ const showAuthQrcode = () => {
 
 const handleQrAuthSuccess = () => {
   haswxLogined.value = true
+  fetchSysInfo()
+  window.dispatchEvent(new CustomEvent('wx-account-updated'))
   Message.success('微信授权成功')
 }
 provide('showAuthQrcode', showAuthQrcode)

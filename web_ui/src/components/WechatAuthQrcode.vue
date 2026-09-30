@@ -72,7 +72,9 @@ const startAuth = async () => {
         })
   } catch (err) {
     loading.value = false
-    errorMessage.value = '获取二维码失败，请重试'
+    errorMessage.value = typeof err === 'string'
+      ? err
+      : (err as any)?.message || '获取二维码失败，请重试'
     emit('error', err)
   }
 }

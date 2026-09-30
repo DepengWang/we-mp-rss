@@ -37,6 +37,8 @@ class Wx:
         self.refresh_interval=3660*24
         self.controller=PlaywrightController()
         self._account_operation_lock = Lock()
+        self._qr_login_in_progress = False
+        self._last_qr_auth_error = ""
         if not os.path.exists(self.lock_path):
             os.makedirs(self.lock_path)
         self.Clean()
@@ -311,6 +313,7 @@ class Wx:
                 "expiry": expiry,
                 "wx_login_url": str(session.get("wx_login_url") or ""),
                 "ext_data": ext_data or {},
+                "token_status": token_status,
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
             },
             "checked_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
@@ -344,11 +347,222 @@ class Wx:
                 "expiry": session.get("expiry") or {},
                 "wx_login_url": str(session.get("wx_login_url") or ""),
                 "ext_data": ext_data,
+                "token_status": "valid",
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-            })
+            }, active=True)
         from driver.success import setStatus
         setStatus(self._haslogin)
         return ext_data
+
+    async def _active_account_entry(self):
+        """Resolve the live account ID and verify it against the visible account name."""
+        ext_data = await self._extract_wechat_data()
+        current_name = str((ext_data or {}).get("wx_app_name") or "").strip()
+        await self._open_account_switch_dialog()
+        entries = await self._read_account_switch_entries()
+        active = [entry for entry in entries if entry["is_active"]]
+        if len(active) > 1:
+            raise RuntimeError("公众号账号列表标记了多个当前账号，拒绝保存不确定的会话")
+        if len(active) == 1:
+            target = active[0]
+        elif current_name:
+            matches = [entry for entry in entries if entry["name"] == current_name]
+            if len(matches) != 1:
+                raise RuntimeError("无法唯一确认扫码授权后的公众号 account_id")
+            target = matches[0]
+        else:
+            raise RuntimeError("无法读取当前公众号名称或 account_id")
+        if current_name and target["name"] != current_name:
+            raise RuntimeError("公众号页面名称与账号切换列表不一致，拒绝保存错误账号")
+        return target
+
+    async def _record_live_account_session(self, *, newly_authorized: bool, active: bool):
+        from driver.token import record_authorized_account_session
+
+        target = await self._active_account_entry()
+        await self._close_account_switch_dialog()
+        snapshot = await self._capture_account_status(target)
+        account_session = snapshot.pop("session", {})
+        if snapshot.get("token_status") != "valid":
+            raise RuntimeError("当前公众号 Token 未通过有效性检查")
+        if not account_session.get("token") or not account_session.get("cookies"):
+            raise RuntimeError("未能取得完整 talking/token 与 Cookie 会话")
+        account_session["token_status"] = snapshot["token_status"]
+        record_authorized_account_session(
+            target["account_id"],
+            account_session,
+            snapshot,
+            newly_authorized=newly_authorized,
+            active=active,
+        )
+        return target
+
+    async def preserve_active_account_before_qr_login(self):
+        """Save the valid current account before a new QR login can replace global token_data."""
+        import asyncio
+
+        from driver.account_sessions import is_restorable_account_session
+        from driver.token import (
+            _get_token_data,
+            get_account_sessions_data,
+            get_account_status_data,
+            record_authorized_account_session,
+        )
+
+        current = _get_token_data() or {}
+        token = str(current.get("token") or "").strip()
+        if not token:
+            return False
+        expiry = current.get("expiry") or {}
+        try:
+            expiry_at = float(expiry.get("expiry_timestamp"))
+        except (TypeError, ValueError):
+            expiry_at = None
+        if expiry_at is not None and expiry_at <= time.time():
+            return False
+
+        ext_data = current.get("ext_data") or self.ext_data or {}
+        current_name = str(ext_data.get("wx_app_name") or "").strip()
+        cached_status = get_account_status_data()
+        sessions = get_account_sessions_data()
+        active_id = str(cached_status.get("active_account_id") or "").strip()
+        candidates = []
+        if active_id and active_id in sessions:
+            candidates.append((active_id, sessions[active_id]))
+        if current_name:
+            candidates.extend(
+                (str(account_id), session)
+                for account_id, session in sessions.items()
+                if str(session.get("name") or "").strip() == current_name
+                and str(account_id) != active_id
+            )
+
+        for account_id, cached_session in candidates:
+            if not is_restorable_account_session(cached_session):
+                continue
+            if current_name and cached_session.get("name") and cached_session["name"] != current_name:
+                continue
+            summary = next(
+                (
+                    item for item in cached_status.get("accounts", [])
+                    if isinstance(item, dict) and str(item.get("account_id") or "") == account_id
+                ),
+                {
+                    "account_id": account_id,
+                    "name": str(cached_session.get("name") or current_name),
+                    "token_status": "valid",
+                    "expiry": cached_session.get("expiry") or {},
+                    "ext_data": cached_session.get("ext_data") or ext_data,
+                    "checked_at": cached_session.get("updated_at") or "",
+                },
+            )
+            record_authorized_account_session(
+                account_id,
+                cached_session,
+                summary,
+                active=True,
+            )
+            return True
+
+        # Older versions kept only the active token and encrypted browser cookies.
+        # If its ID is already known, recover that complete bundle without opening a browser.
+        active_summary = next(
+            (
+                item for item in cached_status.get("accounts", [])
+                if isinstance(item, dict) and str(item.get("account_id") or "") == active_id
+            ),
+            {},
+        )
+        active_name_matches = (
+            not active_summary.get("name")
+            or not current_name
+            or str(active_summary.get("name") or "").strip() == current_name
+        )
+        if active_id and current_name and active_name_matches:
+            cookies = []
+            if isinstance(self.SESSION, dict) and self.SESSION.get("token") == token:
+                cookies = self.SESSION.get("cookies") or []
+            if not cookies:
+                try:
+                    stored = Store.load()
+                    cookies = stored if isinstance(stored, list) else []
+                except Exception:
+                    cookies = []
+            if cookies:
+                session = {
+                    "account_id": active_id,
+                    "name": current_name,
+                    "token": token,
+                    "cookies": cookies,
+                    "cookies_str": str(current.get("cookie") or ""),
+                    "fingerprint": str(current.get("fingerprint") or ""),
+                    "expiry": expiry,
+                    "ext_data": ext_data,
+                    "token_status": "valid",
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                }
+                summary = {
+                    "account_id": active_id,
+                    "name": current_name,
+                    "token_status": "valid",
+                    "expiry": expiry,
+                    "ext_data": ext_data,
+                    "checked_at": session["updated_at"],
+                }
+                record_authorized_account_session(active_id, session, summary, active=True)
+                return True
+
+        if not self._account_operation_lock.acquire(blocking=False):
+            raise RuntimeError("已有公众号账号操作正在进行；本次未启动扫码，以免覆盖当前授权")
+
+        main_queue_was_running = False
+        content_queue_was_running = False
+        try:
+            from core.queue import TaskQueue, ContentTaskQueue
+            main_queue_was_running = TaskQueue._is_running
+            content_queue_was_running = ContentTaskQueue._is_running
+            if TaskQueue._queue.qsize() or ContentTaskQueue._queue.qsize():
+                raise RuntimeError("采集队列有待执行任务；请等任务完成后再开始扫码换号")
+            if main_queue_was_running:
+                TaskQueue.stop()
+            if content_queue_was_running:
+                ContentTaskQueue.stop()
+            for _ in range(120):
+                if TaskQueue._current_task is None and ContentTaskQueue._current_task is None:
+                    break
+                await asyncio.sleep(1)
+            else:
+                raise RuntimeError("等待采集任务结束超时；本次未启动扫码，当前授权未覆盖")
+
+            from driver.success import getStatus, setStatus
+            if not getStatus():
+                # Expiry was not past; let Token() perform the real platform validation.
+                setStatus(True)
+            restored = await self.Token(isClose=False)
+            if not restored or not self._haslogin:
+                raise RuntimeError("无法验证并保全当前公众号会话；本次未启动扫码，原授权未覆盖")
+            target = await self._record_live_account_session(newly_authorized=False, active=True)
+            print_success(f"扫码前已保全当前公众号会话：{target['name']}（{target['account_id']}）")
+            return True
+        finally:
+            try:
+                await self._close_account_switch_dialog()
+                await self.Close()
+            except Exception:
+                pass
+            try:
+                if main_queue_was_running or content_queue_was_running:
+                    await asyncio.sleep(1.5)
+                if main_queue_was_running:
+                    TaskQueue.run_task_background()
+                if content_queue_was_running:
+                    ContentTaskQueue.run_task_background()
+            finally:
+                self._account_operation_lock.release()
+
+    async def _save_qr_authorized_account(self):
+        """A QR login is successful only after its full session is stored by account_id."""
+        return await self._record_live_account_session(newly_authorized=True, active=True)
 
     async def refresh_account_status(self, progress_callback=None):
         """Inspect each available公众号, cache its complete private session, then restore active account."""
@@ -447,8 +661,17 @@ class Wx:
                 # Save each captured account immediately. A later scan/restore error
                 # must not discard already refreshed sessions or other cached IDs.
                 saved_sessions = get_account_sessions_data()
+                previous_session = saved_sessions.get(entry["account_id"], {}) or {}
+                saved_session["authorized_at"] = (
+                    previous_session.get("authorized_at") or time.time()
+                )
+                saved_session["last_active_at"] = (
+                    previous_session.get("last_active_at") or saved_session["authorized_at"]
+                )
                 saved_sessions[entry["account_id"]] = saved_session
                 set_account_sessions_data(saved_sessions)
+                snapshot["authorized_at"] = saved_session["authorized_at"]
+                snapshot["last_active_at"] = saved_session["last_active_at"]
 
             scan_complete = True
             report("restoring", f"账号状态已读取，正在恢复原账号“{original['name']}”…", 90)
@@ -484,6 +707,11 @@ class Wx:
                 if scan_complete and restore_ok and original is not None:
                     checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
                     try:
+                        retained_ids = set(get_account_sessions_data())
+                        snapshots = [
+                            item for item in snapshots
+                            if str(item.get("account_id") or "") in retained_ids
+                        ]
                         set_account_status_data({
                             "accounts": snapshots,
                             "active_account_id": original["account_id"],
@@ -1084,6 +1312,7 @@ class Wx:
                 self._account_operation_lock.release()
     def GetCode(self,CallBack=None,Notice=None):
         self.Notice=Notice
+        self._last_qr_auth_error = ""
         if  self.check_lock():
             print_warning("微信公众平台登录脚本正在运行，请勿重复运行")
             return {
@@ -1126,7 +1355,11 @@ class Wx:
         except Exception as e:
             raise Exception(f"浏览器关闭")  # 重新抛出异常以便外部捕获处理
     def QrStatus(self):
-        return {"login_status":self.HasLogin(),"qr_code":self.GetHasCode()}
+        return {
+            "login_status": self.HasLogin() and not self._last_qr_auth_error,
+            "qr_code": self.GetHasCode(),
+            "error": self._last_qr_auth_error,
+        }
 
     def HasLogin(self):
         with self._login_lock:
@@ -1368,7 +1601,11 @@ class Wx:
                 self._haslogin = True
             setStatus(True)
             self.CallBack = CallBack
-            await self.Call_Success()
+            self._qr_login_in_progress = True
+            try:
+                await self.Call_Success()
+            finally:
+                self._qr_login_in_progress = False
         except Exception as e:
             if "Timeout" in str(e):
                 print_warning("\n扫码登录超时，请重新运行程序进行扫码登录")
@@ -1376,8 +1613,25 @@ class Wx:
             else:
                 print_error(f"\n错误发生: {str(e)}")
             self.SESSION = None
+            if self._last_qr_auth_error:
+                from driver.token import _get_token_data
+                from driver.success import setStatus
+                previous = _get_token_data() or {}
+                previous_expiry = previous.get("expiry") or {}
+                try:
+                    previous_valid = bool(
+                        previous.get("token")
+                        and float(previous_expiry.get("expiry_timestamp")) > time.time()
+                    )
+                except (TypeError, ValueError):
+                    previous_valid = False
+                with self._login_lock:
+                    self._haslogin = previous_valid
+                self.ext_data = previous.get("ext_data") or {}
+                setStatus(previous_valid)
             return self.SESSION
         finally:
+            self._qr_login_in_progress = False
             self.release_lock()
             if NeedExit:
                 self.Clean()
@@ -1430,9 +1684,23 @@ class Wx:
             except Exception as e:
                 print_error(f"获取公众号信息失败: {str(e)}")
                 self.ext_data = None
-            Store.save(cookies)
             # 保存新的 token 和 cookie
             if self.SESSION and self.SESSION.get("token"):
+                if self._qr_login_in_progress:
+                    try:
+                        account = await self._save_qr_authorized_account()
+                        print_success(
+                            f"扫码授权账号已保存：{account['name']}（{account['account_id']}），"
+                            "并保留最近三个有效会话"
+                        )
+                    except Exception as e:
+                        self._last_qr_auth_error = (
+                            "扫码已完成，但未能确认新公众号 account_id；原授权已保留，"
+                            "本次未替换登录。请重试，或先手动刷新账号状态。"
+                        )
+                        print_error(f"扫码账号会话保存失败: {e}")
+                        raise RuntimeError(self._last_qr_auth_error) from e
+                Store.save(cookies)
                 from driver.token import set_token
                 set_token(self.SESSION, self.ext_data)
                 print_success("已更新公众号登录信息")

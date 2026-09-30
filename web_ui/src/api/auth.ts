@@ -77,7 +77,10 @@ export const checkQRCodeStatus = () => {
     }
       interval_status_Id = setInterval(() => {
         http.get("wx/auth/qr/status").then(response => {
-          if(response?.login_status){
+          if (response?.error) {
+            clearInterval(interval_status_Id)
+            reject(new Error(response.error))
+          } else if(response?.login_status){
             Message.success("授权成功")
             clearInterval(interval_status_Id)
             resolve(response)

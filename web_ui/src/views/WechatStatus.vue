@@ -170,7 +170,7 @@
               </div>
             </div>
             <div v-else-if="account.account_id" class="account-session-missing">
-              尚无可恢复的独立会话；请先刷新账号状态，自动轮转仅选择已保存且未过期的账号。
+              尚无完整可恢复会话；重新扫码授权后会自动保存，或手动刷新账号状态补齐。
             </div>
           </template>
           <div v-else class="account-row-empty">暂无第 {{ index + 1 }} 个账号；刷新时会保留此行框架</div>
@@ -179,8 +179,7 @@
 
       <div class="account-status-actions">
         <span class="account-rotation-hint">
-          普通采集任务会在每轮开始前、队列空闲时按有效 account_id 顺序轮转；微信读书模式不切换公众号账号。
-          首次请手动刷新账号状态，以保存各账号的独立会话。
+          扫码授权成功后自动保存当前账号的 talking/token 与 Cookie，并保留最近三个有效账号；普通采集任务按有效 account_id 顺序轮转，微信读书模式不切换公众号账号。
         </span>
         <a-button type="primary" :loading="refreshingAccounts" :disabled="switching" @click="refreshAccountStatuses">
           <template #icon><icon-refresh /></template>
@@ -225,7 +224,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, inject } from 'vue'
+import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
 import { Message } from '@arco-design/web-vue'
 import {
   getSysInfo,
@@ -421,6 +420,16 @@ const refreshToken = async () => {
 onMounted(() => {
   fetchSysInfo()
   fetchAccountStatuses()
+  window.addEventListener('wx-account-updated', refreshAccountView)
+})
+
+const refreshAccountView = () => {
+  fetchSysInfo()
+  fetchAccountStatuses()
+}
+
+onUnmounted(() => {
+  window.removeEventListener('wx-account-updated', refreshAccountView)
 })
 </script>
 

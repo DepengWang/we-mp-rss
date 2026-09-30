@@ -41,7 +41,15 @@ def ApiSuccess(data):
             print("\n登录失败，请检查上述错误信息")
 @router.get("/qr/code", summary="获取登录二维码")
 async def get_qrcode(current_user=Depends(get_current_user)):
-
+    try:
+        # Preserve an apparently valid active account before the new QR flow can
+        # replace the single global token_data record.
+        await WX_API.preserve_active_account_before_qr_login()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"保全当前公众号授权失败，本次未启动扫码：{e}",
+        )
     code_url=WX_API.GetCode(Success)
     return success_response(code_url)
 @router.get("/qr/image", summary="获取登录二维码图片")
@@ -464,6 +472,8 @@ async def wx_account_status(current_user: dict = Depends(get_current_user)):
             },
             "ext_data": session.get("ext_data") or {},
             "checked_at": str(session.get("updated_at") or ""),
+            "authorized_at": session.get("authorized_at"),
+            "last_active_at": session.get("last_active_at"),
         })
 
     active_matches = [item for item in accounts if current_name and item.get("name") == current_name]
@@ -525,6 +535,8 @@ async def wx_account_status(current_user: dict = Depends(get_current_user)):
         session = sessions.get(str(item.get("account_id") or ""), {}) or {}
         item["has_saved_session"] = bool(session.get("token") and session.get("cookies"))
         item["session_updated_at"] = str(session.get("updated_at") or "")
+        item["authorized_at"] = session.get("authorized_at") or item.get("authorized_at")
+        item["last_active_at"] = session.get("last_active_at") or item.get("last_active_at")
         expiry = item.get("expiry") or {}
         timestamp = expiry.get("expiry_timestamp")
         try:
@@ -549,6 +561,26 @@ async def wx_account_status(current_user: dict = Depends(get_current_user)):
     uses_active_account = gather_model not in {"weread", "weread_mp"}
     for item in accounts:
         item["collector_associated"] = bool(item["is_active"] and uses_active_account)
+
+    def account_recency(item):
+        session = sessions.get(str(item.get("account_id") or ""), {}) or {}
+        values = (
+            session.get("last_active_at"), item.get("last_active_at"),
+            session.get("authorized_at"), item.get("authorized_at"),
+            session.get("updated_at"), item.get("checked_at"),
+        )
+        for value in values:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                try:
+                    return time.mktime(time.strptime(str(value), "%Y-%m-%d %H:%M:%S"))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+        return 0.0
+
+    accounts.sort(key=lambda item: (bool(item.get("is_active")), account_recency(item)), reverse=True)
+    accounts = accounts[:3]
 
     return success_response({
         "accounts": accounts,

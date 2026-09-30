@@ -3,9 +3,11 @@ from core.config import Config,cfg
 # 确保data目录和wx.lic文件存在
 import os
 import json
+import time
 import threading
 from core.print import print_success, print_warning
 from core.redis_client import redis_client
+from driver.account_sessions import retain_recent_valid_sessions, is_restorable_account_session
 
 REDIS_TOKEN_PREFIX = "werss:token:"
 REDIS_ACCOUNT_STATUS_KEY = "werss:wx:account_status"
@@ -134,6 +136,8 @@ def set_account_status_data(data: dict) -> None:
             },
             "ext_data": _public_account_ext_data(account.get("ext_data")),
             "checked_at": str(account.get("checked_at", "")),
+            "authorized_at": account.get("authorized_at"),
+            "last_active_at": account.get("last_active_at"),
         })
 
     payload = {
@@ -217,8 +221,12 @@ def set_account_sessions_data(sessions: dict) -> None:
                 "wx_login_url": str(account.get("wx_login_url") or ""),
                 "ext_data": _public_account_ext_data(ext_data),
                 "updated_at": str(account.get("updated_at") or ""),
+                "authorized_at": account.get("authorized_at"),
+                "last_active_at": account.get("last_active_at"),
+                "token_status": str(account.get("token_status") or "valid"),
             }
 
+    payload = retain_recent_valid_sessions(payload, limit=3)
     serialized = json.dumps(payload, ensure_ascii=False)
     with _ACCOUNT_SESSIONS_LOCK:
         wx_cfg.set("account_sessions_data", payload)
@@ -229,12 +237,88 @@ def set_account_sessions_data(sessions: dict) -> None:
                 print_warning(f"公众号账号会话写入Redis失败，已保存在本地文件: {e}")
 
 
-def update_account_session_data(account_id: str, account: dict) -> None:
+def update_account_session_data(account_id: str, account: dict, active: bool = False) -> None:
     """Upsert one account session without removing other accounts from the cache."""
     account_id = str(account_id or "").strip()
     if not account_id or not isinstance(account, dict):
         return
     with _ACCOUNT_SESSIONS_LOCK:
         sessions = get_account_sessions_data()
-        sessions[account_id] = {**account, "account_id": account_id}
+        existing = sessions.get(account_id, {}) or {}
+        now = time.time()
+        updated = {**existing, **account, "account_id": account_id}
+        if not updated.get("authorized_at"):
+            updated["authorized_at"] = existing.get("authorized_at") or now
+        if active:
+            updated["last_active_at"] = now
+        elif not updated.get("last_active_at"):
+            updated["last_active_at"] = existing.get("last_active_at") or updated["authorized_at"]
+        if active or not updated.get("token_status"):
+            updated["token_status"] = "valid"
+        sessions[account_id] = updated
         set_account_sessions_data(sessions)
+
+
+def record_authorized_account_session(
+    account_id: str,
+    account: dict,
+    summary: dict,
+    *,
+    newly_authorized: bool = False,
+    active: bool = False,
+    limit: int = 3,
+) -> dict:
+    """Persist a full per-account session and its public summary as one rolling set."""
+    account_id = str(account_id or "").strip()
+    if not account_id or not isinstance(account, dict) or not isinstance(summary, dict):
+        raise ValueError("公众号账号 ID 或会话信息不完整")
+
+    now = time.time()
+    sessions = get_account_sessions_data()
+    existing = sessions.get(account_id, {}) or {}
+    session = {**existing, **account, "account_id": account_id}
+    session["authorized_at"] = now if newly_authorized else (
+        existing.get("authorized_at") or session.get("authorized_at") or now
+    )
+    if active or newly_authorized:
+        session["last_active_at"] = now
+    else:
+        session["last_active_at"] = (
+            existing.get("last_active_at") or session.get("last_active_at") or session["authorized_at"]
+        )
+    session["updated_at"] = str(session.get("updated_at") or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)))
+    session["token_status"] = str(summary.get("token_status") or session.get("token_status") or "valid")
+    if not is_restorable_account_session(session, now):
+        raise ValueError("公众号会话不完整或 Token 已失效，未保存为可切换账号")
+
+    sessions[account_id] = session
+    retained = retain_recent_valid_sessions(sessions, limit=limit, now=now)
+    if account_id not in retained:
+        raise ValueError("公众号会话未能进入最近有效账号缓存")
+    set_account_sessions_data(retained)
+
+    previous_status = get_account_status_data()
+    status_by_id = {
+        str(item.get("account_id") or ""): dict(item)
+        for item in previous_status.get("accounts", [])
+        if isinstance(item, dict) and item.get("account_id")
+    }
+    status_row = {**summary, "account_id": account_id}
+    status_row["authorized_at"] = session["authorized_at"]
+    status_row["last_active_at"] = session["last_active_at"]
+    status_row["checked_at"] = str(status_row.get("checked_at") or session["updated_at"])
+    status_by_id[account_id] = status_row
+    ordered_status = [
+        status_by_id[saved_id]
+        for saved_id in retained
+        if saved_id in status_by_id
+    ]
+    active_id = account_id if active or newly_authorized else str(previous_status.get("active_account_id") or "")
+    if active_id not in retained:
+        active_id = account_id
+    set_account_status_data({
+        "accounts": ordered_status,
+        "active_account_id": active_id,
+        "checked_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+    })
+    return retained[account_id]
