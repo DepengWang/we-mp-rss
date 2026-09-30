@@ -92,6 +92,11 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
         mock_articles = []
         success = False
         error_msg = None
+        limited = False
+        source_status = "failed"
+        web_status = "not_run"
+        weread_status = "not_used"
+        collection_method = "web"
         
         try:
             if isTest:
@@ -111,6 +116,15 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
             else:
                 wx = WxGather().Model()
                 gather_model = str(cfg.get("gather.model") or "web").lower()
+                blocked_reason = ""
+                if gather_model == "weread_mp":
+                    batch_weread = tracker.get_weread_state(task.id)
+                    collection_method = "weread_primary"
+                    if batch_weread["status"] != "valid":
+                        weread_status = batch_weread["status"]
+                        blocked_reason = f"微信读书采集未执行（{batch_weread['message']}）"
+                    else:
+                        weread_status = "used"
                 is_weread_feed = (
                     str(mp.id or "").startswith("MP_WXS_")
                     and mp.id != "MP_WXS_FEATURED_ARTICLES"
@@ -121,51 +135,105 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                     gather_model == "auto" and is_weread_feed
                 )
                 if use_weread and is_weread_feed:
-                    from core.wx.model.weread_mp import MpsWereadMP
-                    _mp_wx = MpsWereadMP()
-                    _mp_wx._load_weread_auth()
-                    if _mp_wx._weread_cookies:
-                        wx = _mp_wx
-                        print_info(f"[{mp.mp_name}] 微信读书公众号 → weread_mp 采集模式")
+                    batch_weread = tracker.get_weread_state(task.id)
+                    if batch_weread["status"] != "valid":
+                        weread_status = batch_weread["status"]
+                        blocked_reason = f"微信读书采集未执行（{batch_weread['message']}）"
                     else:
-                        print_warning(f"[{mp.mp_name}] 微信读书 Cookie 未配置，跳过采集")
-                        raise RuntimeError("微信读书 Cookie 未配置")
+                        from core.wx.model.weread_mp import MpsWereadMP
+                        _mp_wx = MpsWereadMP()
+                        _mp_wx._load_weread_auth()
+                        if _mp_wx._weread_cookies:
+                            wx = _mp_wx
+                            weread_status = "used"
+                            collection_method = "weread_primary"
+                            print_info(f"[{mp.mp_name}] 微信读书公众号 → weread_mp 采集模式")
+                        else:
+                            blocked_reason = "微信读书 Cookie 未配置，跳过采集"
                 try:
                     from core.wx.collection_guard import CollectionGuard
                     guard = CollectionGuard(mp.id)
                     with guard.hold():
                         try:
+                            if blocked_reason:
+                                raise RuntimeError(blocked_reason)
                             wx.get_Articles(mp.faker_id,CallBack=UpdateArticle,Mps_id=mp.id,Mps_title=mp.mp_name, MaxPage=1,Over_CallBack=Update_Over,interval=interval)
                             if getattr(wx, "collection_failed", False):
                                 raise RuntimeError(
                                     getattr(wx, "collection_error", "Web 采集失败")
                                 )
-                        except Exception:
+                            web_status = "not_used" if collection_method.startswith("weread_") else "success"
+                        except Exception as collection_error:
+                            last_error = getattr(wx, "last_error", {}) or {}
+                            if str(last_error.get("code")) in {"-2012", "-2010", "-2041"}:
+                                weread_status = "invalid"
+                                tracker.mark_weread_invalid(
+                                    task.id,
+                                    "微信读书 Token 在本批采集中失效，后续订阅源将跳过微信读书采集",
+                                )
+                            if getattr(wx, "collection_limited", False):
+                                # A rate-limit response is terminal for this feed:
+                                # no retries, alternate endpoints, or WeRead fallback.
+                                limited = True
+                                if collection_method.startswith("weread_"):
+                                    weread_status = "rate_limited"
+                                    web_status = "not_used"
+                                else:
+                                    web_status = "limited"
+                                raise collection_error
+                            web_status = "not_used" if collection_method.startswith("weread_") else "failed"
                             if gather_model != "web" or not is_weread_feed:
-                                raise
+                                raise collection_error
+                            weread_state = tracker.get_weread_state(task.id)
+                            weread_status = weread_state["status"]
+                            if weread_status != "valid":
+                                weread_status = f"skipped_{weread_state['status']}"
+                                raise RuntimeError(
+                                    f"Web 采集失败；微信读书兜底未执行（{weread_state['message']}）"
+                                ) from collection_error
                             from core.wx.model.weread_mp import MpsWereadMP
                             fallback_wx = MpsWereadMP()
-                            fallback_wx._load_weread_auth()
-                            if not fallback_wx._weread_cookies:
-                                raise
+                            weread_status = "attempted"
+                            collection_method = "weread_fallback"
                             print_warning(
                                 f"[{mp.mp_name}] web 采集失败，回退到 weread_mp"
                             )
-                            fallback_wx.get_Articles(
-                                mp.faker_id,
-                                CallBack=UpdateArticle,
-                                Mps_id=mp.id,
-                                Mps_title=mp.mp_name,
-                                MaxPage=1,
-                                Over_CallBack=Update_Over,
-                                interval=interval,
-                            )
+                            try:
+                                fallback_wx.get_Articles(
+                                    mp.faker_id,
+                                    CallBack=UpdateArticle,
+                                    Mps_id=mp.id,
+                                    Mps_title=mp.mp_name,
+                                    MaxPage=1,
+                                    Over_CallBack=Update_Over,
+                                    interval=interval,
+                                )
+                            except Exception:
+                                last_error = getattr(fallback_wx, "last_error", {}) or {}
+                                if getattr(fallback_wx, "collection_limited", False):
+                                    limited = True
+                                    weread_status = "rate_limited"
+                                    error_msg = getattr(fallback_wx, "collection_error", "微信读书采集触发频率限制")
+                                elif str(last_error.get("code")) in {"-2012", "-2010", "-2041"}:
+                                    weread_status = "invalid"
+                                    tracker.mark_weread_invalid(
+                                        task.id,
+                                        "微信读书 Token 在本批采集中失效，后续订阅源将跳过微信读书兜底",
+                                    )
+                                else:
+                                    weread_status = "failed"
+                                raise
                             wx = fallback_wx
+                            weread_status = "used"
                     guard.record_success()
                     success = True
                 except Exception as e:
                     print_error(f"获取文章失败 [{mp.mp_name}]: {e}")
                     error_msg = str(e)
+                    if limited:
+                        source_status = "rate_limited"
+                    else:
+                        source_status = "failed"
                     # 不抛出异常，继续执行后续流程
                 finally:
                     count = wx.all_count() if wx else 0
@@ -185,6 +253,8 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                         error_msg = f"Webhook: {str(e)}"
 
             print_success(f"任务({task.id})[{mp.mp_name}]采集完成,{count}条新文章")
+            if success:
+                source_status = "success"
 
             # 采集成功（即使本次没有新文章）就清除环境异常记录。
             if not isTest and success:
@@ -227,6 +297,10 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                     error=error_msg,
                     feed=mp,
                     articles=mock_articles,
+                    status=source_status,
+                    web_status=web_status,
+                    weread_status=weread_status,
+                    collection_method=collection_method,
                 )
 
 from core.queue import TaskQueue
@@ -260,13 +334,33 @@ class MessageTaskTracker:
                 'start_time': datetime.now().isoformat(),
                 'mp_results': [],
                 'task': task,
+                'weread_status': 'not_checked',
+                'weread_message': '尚未检查',
                 'webhook_sent': False,
                 'finalizing': False,
                 'finished': False,
             }
             return True
+
+    def set_weread_state(self, task_id: str, status: str, message: str) -> None:
+        with self._task_lock:
+            task_info = self._tasks.get(task_id)
+            if task_info:
+                task_info['weread_status'] = status
+                task_info['weread_message'] = message
+
+    def get_weread_state(self, task_id: str) -> dict:
+        with self._task_lock:
+            task_info = self._tasks.get(task_id, {})
+            return {
+                'status': task_info.get('weread_status', 'not_checked'),
+                'message': task_info.get('weread_message', '尚未检查'),
+            }
+
+    def mark_weread_invalid(self, task_id: str, message: str) -> None:
+        self.set_weread_state(task_id, 'invalid', message)
     
-    def record_mp_result(self, task_id: str, mp_name: str, success: bool, article_count: int = 0, error: str = None, feed=None, articles=None) -> None:
+    def record_mp_result(self, task_id: str, mp_name: str, success: bool, article_count: int = 0, error: str = None, feed=None, articles=None, status=None, web_status="not_run", weread_status="not_used", collection_method="web") -> None:
         """记录单个公众号的执行结果"""
         with self._task_lock:
             if task_id not in self._tasks:
@@ -277,13 +371,23 @@ class MessageTaskTracker:
                 return
             if success:
                 task_info['completed'] += 1
-            else:
+            elif status != 'rate_limited':
                 task_info['failed'] += 1
             
             task_info['mp_results'].append({
                 'mp_name': mp_name,
                 'feed': feed,
                 'success': success,
+                'status': status or ('success' if success else 'failed'),
+                'status_label': {
+                    'success': '采集成功',
+                    'rate_limited': '频率限制（已跳过）',
+                    'failed': '采集失败',
+                }.get(status or ('success' if success else 'failed'), '采集失败'),
+                'status_color': 'info' if success else ('comment' if status == 'rate_limited' else 'warning'),
+                'web_status': web_status,
+                'weread_status': weread_status,
+                'collection_method': collection_method,
                 'article_count': article_count,
                 'articles': list(articles or []),
                 'error': error,
@@ -291,8 +395,9 @@ class MessageTaskTracker:
             })
             
             # 打印进度
-            progress = task_info['completed'] + task_info['failed']
-            print_info(f"任务进度 [{task_id}]: {progress}/{task_info['total']} (成功:{task_info['completed']}, 失败:{task_info['failed']})")
+            progress = len(task_info['mp_results'])
+            limited_count = sum(1 for item in task_info['mp_results'] if item.get('status') == 'rate_limited')
+            print_info(f"任务进度 [{task_id}]: {progress}/{task_info['total']} (成功:{task_info['completed']}, 限制:{limited_count}, 失败:{task_info['failed']})")
             
             # 检查是否全部完成
             should_finish = progress >= task_info['total'] and not task_info['finalizing']
@@ -311,6 +416,8 @@ class MessageTaskTracker:
                 return
             results = list(task_info['mp_results'])
             task = task_info.get('task')
+            weread_status = task_info.get('weread_status', 'not_checked')
+            weread_message = task_info.get('weread_message', '尚未检查')
         try:
             print_success(f"\n{'='*50}")
             print_success(f"消息任务 [{task_id}] 执行完成!")
@@ -322,30 +429,39 @@ class MessageTaskTracker:
             if not task:
                 return
 
-            # 成功但无新文章的订阅源不发送；失败项必须保留，便于告警。
             webhook_results = []
             for item in results:
-                if not item['success'] or item['article_count'] > 0:
-                    webhook_results.append({
-                        'feed': item.get('feed'),
-                        'mp_name': item['mp_name'],
-                        'articles': item.get('articles', []),
-                        'article_count': item['article_count'],
-                        'success': item['success'],
-                        'status': 'success' if item['success'] else 'failed',
-                        'status_color': 'info' if item['success'] else 'warning',
-                        'error': item.get('error') or '',
-                    })
-
-            if not webhook_results:
-                print_info(f"消息任务 [{task_id}] 没有新文章且没有失败，不发送Webhook")
-                return
+                result = dict(item)
+                titles = [
+                    str(article.get('title') if isinstance(article, dict) else getattr(article, 'title', '') or '')
+                    for article in item.get('articles', [])
+                ]
+                if item['success'] and titles:
+                    result['message'] = '；'.join(titles)
+                elif item['success']:
+                    result['message'] = '无新文章'
+                elif item['status'] == 'rate_limited':
+                    result['message'] = item.get('error') or '遇到频率限制，已跳过'
+                else:
+                    result['message'] = item.get('error') or '采集失败'
+                webhook_results.append(result)
 
             summary = {
                 'total': task_info['total'],
                 'successful': task_info['completed'],
                 'failed': task_info['failed'],
+                'rate_limited': sum(1 for item in results if item.get('status') == 'rate_limited'),
+                'source_rate_limited': sum(1 for item in results if item.get('web_status') == 'limited'),
+                'weread_rate_limited': sum(1 for item in results if item.get('weread_status') == 'rate_limited'),
                 'new_articles': sum(item['article_count'] for item in results),
+                'weread_fallback_successes': sum(1 for item in results if item.get('collection_method') == 'weread_fallback' and item.get('success')),
+                'weread_fallback_failures': sum(1 for item in results if item.get('collection_method') == 'weread_fallback' and item.get('weread_status') in {'failed', 'invalid'}),
+                'weread_status': weread_status,
+                'weread_status_label': {
+                    'valid': '有效', 'invalid': '失效', 'unknown': '无法确认',
+                    'not_checked': '未检查',
+                }.get(weread_status, weread_status),
+                'weread_message': weread_message,
             }
             try:
                 from jobs.webhook import MessageWebHook
@@ -374,6 +490,7 @@ def add_job(feeds:list[Feed]=None,task:MessageTask=None,isTest=False):
     if isTest:
         TaskQueue.clear_queue()
 
+    weread_refresh_warning = ""
     # 微信读书模式：在「执行 / 定时任务」真正同步文章前，若 Cookie 过期则自动
     # 请宿主机刷新代理去刷新（容器不跑浏览器，见 scripts/host_weread_refresh_agent.py）。
     # 这样用户无需手动敲命令——点执行或定时触发时即自动保活 Cookie。
@@ -382,17 +499,15 @@ def add_job(feeds:list[Feed]=None,task:MessageTask=None,isTest=False):
             from core.weread_cookie_refresh import request_host_refresh
             res = request_host_refresh()
             if res.get("triggered") and not res.get("ok"):
-                # 刷新失败（多为登录态过期需扫码）→ 中止本次任务并给出明确提示
                 msg = res.get("message") or "Cookie 刷新失败"
-                print_error(f"[cookie] 自动刷新失败: {msg}")
-                raise RuntimeError(f"微信读书 Cookie 自动刷新失败：{msg}")
+                weread_refresh_warning = f"宿主机自动刷新失败：{msg}"
+                print_warning(f"[cookie] {weread_refresh_warning}；继续检查当前 Cookie 状态")
             if res.get("triggered"):
                 print_info(f"[cookie] 自动刷新: {res.get('message')}")
-        except RuntimeError:
-            raise
         except Exception as e:
-            # 代理调用异常等：不阻断同步（可能 Cookie 仍有效），仅告警
-            print_warning(f"[cookie] 自动刷新异常（继续执行）: {e}")
+            # 代理调用异常不阻断批次；随后直接验证当前 Cookie 再决定是否使用。
+            weread_refresh_warning = f"宿主机自动刷新异常：{e}"
+            print_warning(f"[cookie] {weread_refresh_warning}，继续检查当前 Cookie 状态")
 
     # 动态获取公众号列表：如果 feeds 为 None 且 task 不为 None，则动态获取
     if feeds is None and task is not None:
@@ -402,6 +517,20 @@ def add_job(feeds:list[Feed]=None,task:MessageTask=None,isTest=False):
     if task and not isTest and feeds:
         if not tracker.start_task(task.id, len(feeds), task):
             return
+        try:
+            from core.wx.model.weread_mp import MpsWereadMP
+            weread_status, weread_message = MpsWereadMP().validate_auth()
+        except Exception as exc:
+            weread_status, weread_message = 'unknown', f'微信读书状态检查异常：{exc}'
+        if weread_refresh_warning and weread_status != 'valid':
+            weread_message = f"{weread_refresh_warning}；{weread_message}"
+        tracker.set_weread_state(task.id, weread_status, weread_message)
+        if weread_status == 'valid':
+            print_success(f"[weread] 本批次 Token 检查有效：{weread_message}")
+        elif weread_status == 'invalid':
+            print_warning(f"[weread] 本批次兜底已禁用：{weread_message}")
+        else:
+            print_warning(f"[weread] 本批次状态未知，暂不启用兜底：{weread_message}")
 
     with _account_rotation_enqueue_lock:
         gather_model = str(cfg.get("gather.model") or "web").lower()

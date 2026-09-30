@@ -69,7 +69,7 @@ def _raise_response_error(payload: dict):
     raise WereadMPAPIError(
         code,
         message,
-        retriable=code not in (-2041, -2012, -2010),
+        retriable=code not in (-2041, -2012, -2010, 429),
     )
 
 
@@ -119,6 +119,44 @@ def extract_mp_content(html: str) -> str:
 
 class MpsWereadMP(MpsWeread):
     """WeRead-backed collector for existing ``MP_WXS_*`` feeds."""
+
+    def validate_auth(self):
+        """Check the saved WeRead Cookie once before a collection batch.
+
+        Returns (status, message), where status is valid, invalid, or unknown.
+        Network/server errors are deliberately not treated as an expired token.
+        """
+        self._load_weread_auth()
+        if not self._weread_cookies:
+            return "invalid", "微信读书 Cookie 未配置"
+
+        try:
+            response = requests.get(
+                f"{WEREAD_WEB_BASE}/web/shelf/sync",
+                params={"userVid": "", "synckey": 0, "lectureSynckey": 0},
+                headers=self._request_headers(),
+                proxies=self._get_proxies(),
+                timeout=(10, 20),
+            )
+            if response.status_code in (401, 403):
+                return "invalid", f"微信读书认证失败（HTTP {response.status_code}）"
+            if response.status_code != 200:
+                return "unknown", f"微信读书检查暂不可用（HTTP {response.status_code}）"
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return "unknown", "微信读书检查返回格式异常"
+            code = payload.get("errCode", payload.get("errcode", 0))
+            try:
+                code = int(code or 0)
+            except (TypeError, ValueError):
+                return "unknown", "微信读书检查返回无法识别的状态"
+            if code in (-2012, -2010, -2041):
+                return "invalid", "微信读书 Token/Cookie 已失效，请重新扫码"
+            if code != 0:
+                return "unknown", f"微信读书检查返回错误（{code}）"
+            return "valid", "微信读书 Token 有效"
+        except Exception as exc:
+            return "unknown", f"微信读书检查失败：{exc}"
 
     def _get_feed_update_time(self, mp_id: str) -> int:
         from core.db import DB
@@ -457,6 +495,9 @@ class MpsWereadMP(MpsWeread):
         self.start_time = time.time()
         self.response_valid = False
         self.last_error = None
+        self.collection_failed = False
+        self.collection_limited = False
+        self.collection_error = ""
         self._load_weread_auth()
 
         if not self._weread_cookies:
@@ -501,6 +542,10 @@ class MpsWereadMP(MpsWeread):
                     Item_Over_CallBack=Item_Over_CallBack,
                 )
             except WereadMPAPIError as exc:
+                if str(exc.code) in {"-2012", "-2010", "-2041", "429"}:
+                    # Authentication failure/rate limiting is terminal for this
+                    # feed; do not issue a second WeRead request to the cover API.
+                    raise
                 if self.response_valid:
                     # 列表接口本身可用（已成功翻页），属于正文缺失或补抓不完整
                     # 等真实错误，直接上抛，下次任务重试。
@@ -525,6 +570,9 @@ class MpsWereadMP(MpsWeread):
                 ),
             )
         except Exception as exc:
+            self.collection_failed = True
+            self.collection_limited = str(getattr(exc, "code", "")) == "429"
+            self.collection_error = str(exc)
             self.last_error = {
                 "message": str(exc),
                 "code": getattr(exc, "code", "weread_mp_error"),

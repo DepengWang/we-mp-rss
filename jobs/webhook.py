@@ -40,15 +40,27 @@ def _build_summary(results: list[dict]) -> dict:
     return {
         "total": len(results),
         "successful": sum(1 for item in results if item.get("success")),
-        "failed": sum(1 for item in results if not item.get("success")),
+        "failed": sum(1 for item in results if not item.get("success") and item.get("status") != "rate_limited"),
+        "rate_limited": sum(1 for item in results if item.get("status") == "rate_limited"),
+        "source_rate_limited": sum(1 for item in results if item.get("web_status") == "limited"),
+        "weread_rate_limited": sum(1 for item in results if item.get("weread_status") == "rate_limited"),
         "new_articles": sum(len(item.get("articles") or []) for item in results),
+        "weread_status": "not_checked",
+        "weread_status_label": "未检查",
+        "weread_message": "未提供批次状态",
+        "weread_fallback_successes": sum(1 for item in results if item.get("collection_method") == "weread_fallback" and item.get("success")),
+        "weread_fallback_failures": sum(1 for item in results if item.get("collection_method") == "weread_fallback" and item.get("weread_status") in {"failed", "invalid"}),
     }
 
 
-def _flatten_results(results: list[dict]) -> tuple[list[dict], list[dict]]:
+def _flatten_results(results: list[dict]) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict], list[dict]]:
     """为消息模板提供不需要嵌套循环的文章和失败列表。"""
     new_articles = []
     failures = []
+    limited_sources = []
+    weread_limited_sources = []
+    no_new_articles = []
+    weread_fallbacks = []
     for result in results:
         feed = result.get("feed")
         feed_name = result.get("mp_name") or getattr(feed, "mp_name", "")
@@ -58,13 +70,27 @@ def _flatten_results(results: list[dict]) -> tuple[list[dict], list[dict]]:
                 item["feed_name"] = feed_name
                 item["status_color"] = "info"
                 new_articles.append(item)
+        elif result.get("status") == "rate_limited":
+            limited_item = {
+                "feed_name": feed_name,
+                "error": result.get("error") or "遇到频率限制，已跳过本订阅源",
+                "status_color": "comment",
+            }
+            if result.get("weread_status") == "rate_limited":
+                weread_limited_sources.append(limited_item)
+            else:
+                limited_sources.append(limited_item)
         else:
             failures.append({
                 "feed_name": feed_name,
                 "error": result.get("error") or "采集失败",
                 "status_color": "warning",
             })
-    return new_articles, failures
+        if result.get("success") and not result.get("articles"):
+            no_new_articles.append({"feed_name": feed_name, "status_color": "comment"})
+        if result.get("collection_method") == "weread_fallback" and result.get("success"):
+            weread_fallbacks.append({"feed_name": feed_name, "status_color": "info"})
+    return new_articles, failures, limited_sources, weread_limited_sources, no_new_articles, weread_fallbacks
 
 def send_message(hook: MessageWebHook) -> str:
     """
@@ -79,12 +105,26 @@ def send_message(hook: MessageWebHook) -> str:
     if hook.results and not hook.task.message_template:
         template = """### {{ task.name }}
 > 执行时间：{{ now }}
-> 结果：成功 {{ summary.successful }} 个，失败 {{ summary.failed }} 个，新增 {{ summary.new_articles }} 篇
+> 结果：成功 {{ summary.successful }} 个，采集源频率限制 {{ summary.source_rate_limited }} 个，失败 {{ summary.failed }} 个，新增 {{ summary.new_articles }} 篇
+> 微信读书兜底：{{ summary.weread_status_label }}（{{ summary.weread_message }}）
+> 微信读书兜底成功 {{ summary.weread_fallback_successes }} 个，频率限制 {{ summary.weread_rate_limited }} 个，失败 {{ summary.weread_fallback_failures }} 个
 {% for article in new_articles %}
 - <font color=\"{{ article.status_color }}\">[{{ article.feed_name }}] {{ article.title }}</font>：{{ article.url }}
 {% endfor %}
+{% for limited in limited_sources %}
+- <font color=\"{{ limited.status_color }}\">[{{ limited.feed_name }}] 频率限制，已跳过：{{ limited.error }}</font>
+{% endfor %}
+{% for limited in weread_limited_sources %}
+- <font color=\"{{ limited.status_color }}\">[{{ limited.feed_name }}] 微信读书频率限制，已跳过：{{ limited.error }}</font>
+{% endfor %}
 {% for failure in failures %}
 - <font color=\"{{ failure.status_color }}\">[{{ failure.feed_name }}] 采集失败：{{ failure.error }}</font>
+{% endfor %}
+{% for item in no_new_articles %}
+- <font color=\"{{ item.status_color }}\">[{{ item.feed_name }}] 采集成功，无新文章</font>
+{% endfor %}
+{% for item in weread_fallbacks %}
+- <font color=\"{{ item.status_color }}\">[{{ item.feed_name }}] 已通过微信读书兜底采集</font>
 {% endfor %}"""
     else:
         template = hook.task.message_template if hook.task.message_template else """
@@ -118,7 +158,7 @@ def send_message(hook: MessageWebHook) -> str:
         "summary": hook.summary or (_build_summary(processed_results) if hook.results else {}),
     }
     if hook.results:
-        data["new_articles"], data["failures"] = _flatten_results(processed_results)
+        data["new_articles"], data["failures"], data["limited_sources"], data["weread_limited_sources"], data["no_new_articles"], data["weread_fallbacks"] = _flatten_results(processed_results)
     message = parser.render(data)
     # 这里可以添加发送消息的具体实现
     print("发送消息:", message)
@@ -154,8 +194,29 @@ def call_webhook(hook: MessageWebHook, is_test: bool = False) -> str:
     "total": {{ summary.total }},
     "successful": {{ summary.successful }},
     "failed": {{ summary.failed }},
+    "rate_limited": {{ summary.rate_limited }},
+    "source_rate_limited": {{ summary.source_rate_limited }},
+    "weread_rate_limited": {{ summary.weread_rate_limited }},
+    "weread_status": "{{ summary.weread_status }}",
+    "weread_status_label": "{{ summary.weread_status_label }}",
+    "weread_message": "{{ summary.weread_message }}",
+    "weread_fallback_successes": {{ summary.weread_fallback_successes }},
+    "weread_fallback_failures": {{ summary.weread_fallback_failures }},
     "new_articles": {{ summary.new_articles }}
   },
+  "sources": [
+    {% for result in results %}
+    {
+      "feed_name": "{{ result.mp_name }}",
+      "status": "{{ result.status }}",
+      "status_label": "{{ result.status_label }}",
+      "message": "{{ result.message }}",
+      "web_status": "{{ result.web_status }}",
+      "weread_status": "{{ result.weread_status }}",
+      "collection_method": "{{ result.collection_method }}"
+    }{% if not loop.last %},{% endif %}
+    {% endfor %}
+  ],
   "articles": [
     {% for article in new_articles %}
     {
@@ -174,6 +235,21 @@ def call_webhook(hook: MessageWebHook, is_test: bool = False) -> str:
       "error": "{{ failure.error }}",
       "status_color": "{{ failure.status_color }}"
     }{% if not loop.last %},{% endif %}
+    {% endfor %}
+  ],
+  "rate_limited_sources": [
+    {% for limited in limited_sources %}
+    {"feed_name": "{{ limited.feed_name }}", "error": "{{ limited.error }}"}{% if not loop.last %},{% endif %}
+    {% endfor %}
+  ],
+  "weread_rate_limited_sources": [
+    {% for limited in weread_limited_sources %}
+    {"feed_name": "{{ limited.feed_name }}", "error": "{{ limited.error }}"}{% if not loop.last %},{% endif %}
+    {% endfor %}
+  ],
+  "weread_fallback_sources": [
+    {% for item in weread_fallbacks %}
+    "{{ item.feed_name }}"{% if not loop.last %},{% endif %}
     {% endfor %}
   ]
 }"""
@@ -266,7 +342,7 @@ def call_webhook(hook: MessageWebHook, is_test: bool = False) -> str:
         "summary": hook.summary or (_build_summary(processed_results) if hook.results else {}),
     }
     if hook.results:
-        data["new_articles"], data["failures"] = _flatten_results(processed_results)
+        data["new_articles"], data["failures"], data["limited_sources"], data["weread_limited_sources"], data["no_new_articles"], data["weread_fallbacks"] = _flatten_results(processed_results)
 
    # 预处理content字段
     import json
@@ -348,11 +424,10 @@ def web_hook(hook:MessageWebHook, is_test:bool = False):
         ValueError: 当消息类型未知时抛出
     """
     try:
-        # 汇总任务允许只包含失败项；成功但无新文章的订阅源已经在追踪器中剔除。
+        # 汇总任务覆盖每个订阅源状态，包括成功但无新文章的情况。
         if hook.results:
-            if not any(item.get("articles") or not item.get("success") for item in hook.results):
-                logger.info("任务没有新文章且没有采集失败，不发送Webhook")
-                return
+            # 汇总包含每个订阅源状态；即使全是“成功但无新文章”也需要发送，
+            # 以便用户确认本轮任务确实执行完成。
             if hook.task.message_type == 0:
                 return send_message(hook)
             if hook.task.message_type == 1:

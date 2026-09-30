@@ -127,6 +127,9 @@ class MpsFreePublish(WxGather):
         Item_Over_CallBack=None,
         Over_CallBack=None,
     ):
+        self.collection_failed = False
+        self.collection_limited = False
+        self.collection_error = ""
         super().Start(mp_id=Mps_id)
         if self.Gather_Content:
             Gather_Content = True
@@ -153,12 +156,22 @@ class MpsFreePublish(WxGather):
                 resp = session.get(
                     test_url, headers=headers, params=test_params, verify=False, timeout=15
                 )
+                if resp.status_code == 429:
+                    self.collection_limited = True
+                    self.collection_failed = True
+                    self.collection_error = f"{endpoint_name}: HTTP 429 频率限制"
+                    print_warning(self.collection_error)
+                    super().Error(self.collection_error)
+                    return
                 msg = resp.json()
                 ret = msg.get("base_resp", {}).get("ret", -1)
 
                 if ret == 200013:
                     print_warning(f"{endpoint_name}: 频率限制")
-                    continue
+                    self.collection_limited = True
+                    self.collection_failed = True
+                    self.collection_error = "公众号采集触发频率限制"
+                    return
                 if ret == 200003:
                     print_warning(f"{endpoint_name}: Session失效")
                     continue
@@ -186,6 +199,8 @@ class MpsFreePublish(WxGather):
                 continue
 
         if effective_endpoint is None:
+            self.collection_failed = True
+            self.collection_error = "所有公众号采集端点均失败"
             super().Error("所有端点均不可用，请检查登录状态或尝试 Playwright 模式")
             if getattr(self, "_auto_fallback", False):
                 try:
@@ -236,19 +251,32 @@ class MpsFreePublish(WxGather):
             try:
                 headers = self.fix_header(url)
                 resp = session.get(url, headers=headers, params=params, verify=False)
+                if resp.status_code == 429:
+                    self.collection_limited = True
+                    self.collection_failed = True
+                    self.collection_error = "公众号采集触发 HTTP 429 频率限制"
+                    super().Error(self.collection_error)
+                    break
                 msg = resp.json()
                 self._cookies = resp.cookies
 
                 ret = msg.get("base_resp", {}).get("ret", -1)
                 if ret == 200013:
+                    self.collection_limited = True
+                    self.collection_failed = True
+                    self.collection_error = "公众号采集触发频率限制"
                     super().Error(f"frequency control, stop at {str(begin)}")
                     break
                 if ret == 200003:
+                    self.collection_failed = True
+                    self.collection_error = "公众号平台登录态失效"
                     super().Error(
                         f"Invalid Session, stop at {str(begin)}", code="Invalid Session"
                     )
                     break
                 if ret != 0:
+                    self.collection_failed = True
+                    self.collection_error = f"公众号采集接口错误：{msg.get('base_resp', {}).get('err_msg', ret)}"
                     super().Error(
                         f"错误原因:{msg['base_resp']['err_msg']}:代码:{msg['base_resp']['ret']}",
                         code=msg["base_resp"]["err_msg"],
@@ -282,9 +310,13 @@ class MpsFreePublish(WxGather):
                 i += 1
 
             except requests.exceptions.Timeout:
+                self.collection_failed = True
+                self.collection_error = "公众号采集请求超时"
                 print("Request timed out")
                 break
             except requests.exceptions.RequestException as e:
+                self.collection_failed = True
+                self.collection_error = f"公众号采集请求异常：{e}"
                 print(f"Request error: {e}")
                 break
             finally:
@@ -293,7 +325,8 @@ class MpsFreePublish(WxGather):
                     CallBack=Item_Over_CallBack,
                 )
 
-        self.Complete(Mps_id)
+        if not self.collection_failed:
+            self.Complete(Mps_id)
         super().Over(CallBack=Over_CallBack)
 
     def _has_valid_data(self, msg, list_key, parser):

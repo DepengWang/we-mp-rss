@@ -27,6 +27,7 @@ class MpsWeb(WxGather):
     def get_Articles(self, faker_id:str='',Mps_id:str='',Mps_title="",CallBack=None,start_page:int=0,MaxPage:int=1,interval=10,Gather_Content=False,Item_Over_CallBack=None,Over_CallBack=None):
         self.collection_failed = False
         self.collection_error = ""
+        self.collection_limited = False
         super().Start(mp_id=Mps_id)
         Gather_Content = self.Gather_Content
         print(f"Web浏览器模式,是否采集[{Mps_title}]内容：{Gather_Content}\n")
@@ -48,8 +49,6 @@ class MpsWeb(WxGather):
         session=self.session
         # 起始页数
         i = start_page
-        retry_count = 0
-        max_retries = 3
         while True:
             if i >= MaxPage:
                 self.Complete(Mps_id)
@@ -62,16 +61,18 @@ class MpsWeb(WxGather):
             try:
                 headers = self.fix_header(url)
                 resp = session.get(url, headers=headers, params = params, verify=False, timeout=(10, 30))
-                
+                if resp.status_code == 429:
+                    self.collection_limited = True
+                    self.collection_failed = True
+                    self.collection_error = "Web 采集触发 HTTP 429 频率限制"
+                    super().Error(self.collection_error)
+                    break
+
                 msg = resp.json()
                 self._cookies =resp.cookies
                 # 流量控制了, 退出
                 if msg['base_resp']['ret'] == 200013:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        print_warning(f"频率限制, 第{retry_count}次重试...")
-                        time.sleep(60 * retry_count)
-                        continue
+                    self.collection_limited = True
                     self.collection_failed = True
                     self.collection_error = "Web 采集触发频率限制"
                     super().Error("frequencey control, stop at {}".format(str(begin)))
@@ -147,7 +148,8 @@ class MpsWeb(WxGather):
                 break
             finally:
                 super().Item_Over(item={"mps_id":Mps_id,"mps_title":Mps_title},CallBack=Item_Over_CallBack)
-        self.Complete(Mps_id)
+        if not self.collection_failed:
+            self.Complete(Mps_id)
         super().Over(CallBack=Over_CallBack)
         pass
     def _fallback_to_free_publish(self, faker_id, Mps_id, Mps_title, CallBack,
@@ -173,7 +175,12 @@ class MpsWeb(WxGather):
                 Item_Over_CallBack=Item_Over_CallBack,
                 Over_CallBack=Over_CallBack,
             )
+            self.collection_limited = getattr(fp, "collection_limited", False)
+            self.collection_failed = getattr(fp, "collection_failed", False)
+            self.collection_error = getattr(fp, "collection_error", "")
         except Exception as e:
+            self.collection_failed = True
+            self.collection_error = f"降级到 free_publish 失败: {e}"
             print_error(f"降级到 free_publish 失败: {e}")
             super().Error(f"所有采集方式均失败: {e}")
 

@@ -224,7 +224,8 @@ async def run_message_task(
                         all_done = False
                         break
                     total = st.get('total', 0)
-                    done = st.get('completed', 0) + st.get('failed', 0)
+                    # 限频是独立终态，不计入 failed；用结果条数判断批次是否完成。
+                    done = len(st.get('mp_results', []))
                     article_total += sum(r.get('article_count', 0) for r in st.get('mp_results', []))
                     if total and done < total:
                         all_done = False
