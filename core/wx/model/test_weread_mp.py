@@ -116,6 +116,19 @@ class WereadMpRequestTest(unittest.TestCase):
         collector._weread_vid = "123"
         return collector
 
+    @patch("requests.get")
+    def test_validate_auth_does_not_treat_mp_endpoint_code_as_expired_cookie(self, get):
+        response = Mock(status_code=200)
+        response.json.return_value = {"errCode": -2041}
+        get.return_value = response
+        collector = self.make_collector()
+        collector._load_weread_auth = Mock()
+
+        status, message = collector.validate_auth()
+
+        self.assertEqual(status, "unknown")
+        self.assertIn("不能据此判断 Token 失效", message)
+
     @patch("core.wx.model.weread.MpsWeread._get_shelf_books")
     def test_ensure_mp_on_shelf_skips_when_already_present(self, shelf):
         shelf.return_value = [{"book_id": "MP_WXS_1", "title": "t"}]
@@ -229,6 +242,7 @@ class WereadMpCollectorTest(unittest.TestCase):
         collector.http_proxy_url = ""
         collector.get_token = Mock()
         collector._load_weread_auth = Mock()
+        collector.ensure_mp_on_shelf = Mock(return_value=(True, "already on shelf"))
         collector.update_mps = Mock()
         collector._get_feed_update_time = Mock(return_value=0)
         collector._get_content_interval = Mock(return_value=0)
@@ -236,56 +250,64 @@ class WereadMpCollectorTest(unittest.TestCase):
         return collector
 
     @patch("core.wx.base.RSS.clear_cache")
-    @patch("core.wx.base.setStatus")
-    def test_get_articles_collects_mp_article_and_advances_after_success(
-        self, _set_status, _clear_cache
-    ):
+    def test_get_articles_uses_cover_api_for_latest_only(self, _clear_cache):
         collector = self.make_collector()
-        collector._get_mp_articles_page = Mock(return_value={
-            "reviews": [{
-                "subReviews": [{
-                    "review": {
-                        "reviewId": "MP_WXS_1_review-1",
-                        "createTime": 1778580001,
-                        "mpInfo": {
-                            "title": "Article title",
-                            "content": "Summary",
-                            "time": 1778580002,
-                            "originalId": "abc~def",
-                            "pic_url": "https://example.test/cover.jpg",
-                        },
-                    }
-                }]
-            }]
+        collector._get_mp_articles_page = Mock(side_effect=AssertionError("legacy list API used"))
+        collector._get_mp_cover = Mock(return_value={
+            "reviewId": "MP_WXS_1_latest",
+            "title": "Latest",
+            "pic": "https://example.test/pic.jpg",
+            "digest": "Summary",
         })
+        collector._is_article_gathered = Mock(return_value=False)
         collector._get_mp_content = Mock(return_value="<p>Full text</p>")
         saved = []
 
         collector.get_Articles(
-            faker_id="legacy-fake-id",
             Mps_id="MP_WXS_1",
             Mps_title="Feed title",
             CallBack=lambda article: saved.append(article) or True,
-            MaxPage=1,
             Gather_Content=True,
             interval=0,
         )
 
-        collector._get_mp_articles_page.assert_called_once_with("MP_WXS_1", offset=0)
-        self.assertEqual(saved[0]["url"], "https://mp.weixin.qq.com/s/abc_def")
+        collector._get_mp_cover.assert_called_once_with("MP_WXS_1")
+        collector._get_mp_articles_page.assert_not_called()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["title"], "Latest")
+        self.assertEqual(saved[0]["url"], "https://mp.weixin.qq.com/s/latest")
         self.assertEqual(saved[0]["content"], "<p>Full text</p>")
-        self.assertEqual(saved[0]["publish_time"], 1778580002)
         self.assertEqual(collector.all_count(), 1)
         collector.update_mps.assert_called_once()
-        updated_feed = collector.update_mps.call_args.args[1]
-        self.assertEqual(updated_feed.update_time, 1778580002)
 
     @patch("core.wx.base.RSS.clear_cache")
-    def test_get_articles_does_not_advance_after_list_failure(self, _clear_cache):
+    def test_get_articles_skips_latest_article_already_gathered(self, _clear_cache):
         collector = self.make_collector()
-        collector._get_mp_articles_page = Mock(
-            side_effect=WereadMPAPIError(-2041, "blocked", retriable=False)
+        collector._get_mp_articles_page = Mock(side_effect=AssertionError("legacy list API used"))
+        collector._get_mp_cover = Mock(return_value={
+            "reviewId": "MP_WXS_1_latest",
+            "title": "Already saved",
+        })
+        collector._is_article_gathered = Mock(return_value=True)
+        saved = []
+
+        collector.get_Articles(
+            Mps_id="MP_WXS_1",
+            Mps_title="Feed title",
+            CallBack=lambda article: saved.append(article) or True,
+            interval=0,
         )
+
+        collector._get_mp_cover.assert_called_once_with("MP_WXS_1")
+        collector._get_mp_articles_page.assert_not_called()
+        self.assertEqual(saved, [])
+        self.assertEqual(collector.all_count(), 0)
+        collector.update_mps.assert_called_once()
+
+    @patch("core.wx.base.RSS.clear_cache")
+    def test_cover_auth_error_does_not_advance_feed_state(self, _clear_cache):
+        collector = self.make_collector()
+        collector._get_mp_articles_page = Mock(side_effect=AssertionError("legacy list API used"))
         collector._get_mp_cover = Mock(
             side_effect=WereadMPAPIError(-2012, "login expired")
         )
@@ -295,260 +317,62 @@ class WereadMpCollectorTest(unittest.TestCase):
                 Mps_id="MP_WXS_1",
                 Mps_title="Feed title",
                 CallBack=lambda article: True,
-                MaxPage=1,
                 interval=0,
             )
 
-        collector.update_mps.assert_not_called()
-
-    @patch("core.wx.base.RSS.clear_cache")
-    def test_list_failure_falls_back_to_cover_latest_article(self, _clear_cache):
-        collector = self.make_collector()
-        collector._get_mp_articles_page = Mock(
-            side_effect=WereadMPAPIError(-2041, "blocked", retriable=False)
-        )
-        collector._get_mp_cover = Mock(return_value={
-            "reviewId": "MP_WXS_1_latest",
-            "title": "Latest",
-            "pic": "https://example.test/pic.jpg",
-        })
-        saved = []
-
-        collector.get_Articles(
-            Mps_id="MP_WXS_1",
-            Mps_title="Feed title",
-            CallBack=lambda article: saved.append(article) or True,
-            MaxPage=1,
-            interval=0,
-        )
-
-        self.assertEqual(len(saved), 1)
-        self.assertEqual(saved[0]["title"], "Latest")
-        self.assertEqual(saved[0]["url"], "https://mp.weixin.qq.com/s/latest")
-        collector.update_mps.assert_called_once()
-
-    @patch("core.wx.base.RSS.clear_cache")
-    def test_pagination_counts_groups_not_articles(self, _clear_cache):
-        collector = self.make_collector()
-        collector._get_mp_articles_page = Mock(side_effect=[
-            {
-                "reviews": [
-                    {"subReviews": [{} for _ in range(20)]},
-                ],
-            },
-            {"reviews": []},
-        ])
-
-        collector.get_Articles(
-            Mps_id="MP_WXS_1",
-            Mps_title="Feed title",
-            CallBack=lambda article: True,
-            MaxPage=2,
-            interval=0,
-        )
-
-        self.assertEqual(
-            collector._get_mp_articles_page.call_args_list,
-            [
-                unittest.mock.call("MP_WXS_1", offset=0),
-                unittest.mock.call("MP_WXS_1", offset=1),
-            ],
-        )
-
-    @patch("core.wx.base.RSS.clear_cache")
-    def test_scheduled_run_catches_up_to_previous_update_time(self, _clear_cache):
-        collector = self.make_collector()
-        collector._get_feed_update_time.return_value = 1778580001
-        collector._get_catchup_page_limit = Mock(return_value=3)
-        collector._is_article_gathered = Mock(
-            side_effect=lambda mp_id, aid: aid == "MP_WXS_1_old"
-        )
-        collector._get_mp_articles_page = Mock(side_effect=[
-            {
-                "reviews": [{
-                    "subReviews": [{
-                        "review": {
-                            "reviewId": "MP_WXS_1_new",
-                            "createTime": 1778580003,
-                            "mpInfo": {"title": "New", "originalId": "new"},
-                        }
-                    }]
-                }]
-            },
-            {
-                "reviews": [{
-                    "subReviews": [{
-                        "review": {
-                            "reviewId": "MP_WXS_1_old",
-                            "createTime": 1778580001,
-                            "mpInfo": {"title": "Old", "originalId": "old"},
-                        }
-                    }]
-                }]
-            },
-        ])
-
-        collector.get_Articles(
-            Mps_id="MP_WXS_1",
-            Mps_title="Feed title",
-            CallBack=lambda article: True,
-            MaxPage=1,
-            interval=0,
-        )
-
-        self.assertEqual(
-            collector._get_mp_articles_page.call_args_list,
-            [
-                unittest.mock.call("MP_WXS_1", offset=0),
-                unittest.mock.call("MP_WXS_1", offset=1),
-            ],
-        )
-        collector.update_mps.assert_called_once()
-
-    @patch("core.wx.base.RSS.clear_cache")
-    def test_cover_era_update_time_does_not_block_backfill(self, _clear_cache):
-        """cover 模式写入的 update_time 是抓取时间（晚于文章发布时间），
-        不能因此跳过 cover 时代漏采的文章；以入库记录为停止边界。"""
-        collector = self.make_collector()
-        collector._get_feed_update_time.return_value = 1778700000
-        collector._is_article_gathered = Mock(
-            side_effect=lambda mp_id, aid: aid == "MP_WXS_1_latest"
-        )
-        collector._get_mp_articles_page = Mock(return_value={
-            "reviews": [{
-                "subReviews": [
-                    {
-                        "review": {
-                            "reviewId": "MP_WXS_1_latest",
-                            "createTime": 1778580003,
-                            "mpInfo": {"title": "Latest", "originalId": "latest"},
-                        }
-                    },
-                    {
-                        "review": {
-                            "reviewId": "MP_WXS_1_missed",
-                            "createTime": 1778580002,
-                            "mpInfo": {"title": "Missed", "originalId": "missed"},
-                        }
-                    },
-                ]
-            }]
-        })
-        saved = []
-
-        collector.get_Articles(
-            Mps_id="MP_WXS_1",
-            Mps_title="Feed title",
-            CallBack=lambda article: saved.append(article) or True,
-            MaxPage=1,
-            interval=0,
-        )
-
-        self.assertEqual([a["title"] for a in saved], ["Missed"])
-        collector.update_mps.assert_called_once()
-
-    @patch("core.wx.base.RSS.clear_cache")
-    def test_incomplete_catchup_does_not_mark_feed_synced(self, _clear_cache):
-        collector = self.make_collector()
-        collector._get_feed_update_time.return_value = 1778580001
-        collector._get_catchup_page_limit = Mock(return_value=1)
-        collector._get_mp_articles_page = Mock(return_value={
-            "reviews": [{
-                "subReviews": [{
-                    "review": {
-                        "reviewId": "MP_WXS_1_new",
-                        "createTime": 1778580003,
-                        "mpInfo": {"title": "New", "originalId": "new"},
-                    }
-                }]
-            }]
-        })
-
-        with self.assertRaises(WereadMPAPIError) as caught:
-            collector.get_Articles(
-                Mps_id="MP_WXS_1",
-                Mps_title="Feed title",
-                CallBack=lambda article: True,
-                MaxPage=1,
-                interval=0,
-            )
-
-        self.assertEqual(caught.exception.code, "backlog_incomplete")
+        collector._get_mp_cover.assert_called_once_with("MP_WXS_1")
+        collector._get_mp_articles_page.assert_not_called()
         collector.update_mps.assert_not_called()
 
     @patch("core.wx.model.weread_mp.time.sleep")
     @patch("core.wx.base.RSS.clear_cache")
-    def test_fulltext_requests_are_throttled_between_articles(self, _clear_cache, sleep):
+    def test_latest_article_content_request_is_throttled(self, _clear_cache, sleep):
         collector = self.make_collector()
         collector._get_content_interval.return_value = 2
-        collector._get_mp_articles_page = Mock(return_value={
-            "reviews": [{
-                "subReviews": [
-                    {
-                        "review": {
-                            "reviewId": "MP_WXS_1_a",
-                            "createTime": 1778580002,
-                            "mpInfo": {"title": "A", "originalId": "a"},
-                        }
-                    },
-                    {
-                        "review": {
-                            "reviewId": "MP_WXS_1_b",
-                            "createTime": 1778580001,
-                            "mpInfo": {"title": "B", "originalId": "b"},
-                        }
-                    },
-                ]
-            }]
+        collector._get_mp_articles_page = Mock(side_effect=AssertionError("legacy list API used"))
+        collector._get_mp_cover = Mock(return_value={
+            "reviewId": "MP_WXS_1_latest",
+            "title": "Latest",
         })
+        collector._is_article_gathered = Mock(return_value=False)
         collector._get_mp_content = Mock(return_value="<p>Full text</p>")
 
         collector.get_Articles(
             Mps_id="MP_WXS_1",
             Mps_title="Feed title",
             CallBack=lambda article: True,
-            MaxPage=1,
             Gather_Content=True,
             interval=0,
         )
 
         sleep.assert_called_once_with(2)
+        collector._get_mp_content.assert_called_once_with("MP_WXS_1_latest")
 
     @patch("core.wx.base.RSS.clear_cache")
-    def test_fulltext_failure_is_not_saved_or_marked_synced(self, _clear_cache):
+    def test_cover_content_failure_keeps_latest_metadata(self, _clear_cache):
         collector = self.make_collector()
-        collector._get_mp_articles_page = Mock(return_value={
-            "reviews": [{
-                "subReviews": [{
-                    "review": {
-                        "reviewId": "MP_WXS_1_review-1",
-                        "createTime": 1778580001,
-                        "mpInfo": {
-                            "title": "Article title",
-                            "originalId": "abc~def",
-                        },
-                    }
-                }]
-            }]
+        collector._get_mp_articles_page = Mock(side_effect=AssertionError("legacy list API used"))
+        collector._get_mp_cover = Mock(return_value={
+            "reviewId": "MP_WXS_1_latest",
+            "title": "Latest",
         })
+        collector._is_article_gathered = Mock(return_value=False)
         collector._get_mp_content = Mock(
             side_effect=WereadMPAPIError(503, "content unavailable")
         )
         saved = []
 
-        with self.assertRaises(WereadMPAPIError) as caught:
-            collector.get_Articles(
-                Mps_id="MP_WXS_1",
-                Mps_title="Feed title",
-                CallBack=lambda article: saved.append(article) or True,
-                MaxPage=1,
-                Gather_Content=True,
-                interval=0,
-            )
+        collector.get_Articles(
+            Mps_id="MP_WXS_1",
+            Mps_title="Feed title",
+            CallBack=lambda article: saved.append(article) or True,
+            Gather_Content=True,
+            interval=0,
+        )
 
-        self.assertEqual(caught.exception.code, "content_incomplete")
-        self.assertEqual(saved, [])
-        collector.update_mps.assert_not_called()
+        self.assertEqual([item["title"] for item in saved], ["Latest"])
+        self.assertEqual(saved[0]["content"], "")
+        collector.update_mps.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

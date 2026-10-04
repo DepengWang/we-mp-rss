@@ -150,8 +150,10 @@ class MpsWereadMP(MpsWeread):
                 code = int(code or 0)
             except (TypeError, ValueError):
                 return "unknown", "微信读书检查返回无法识别的状态"
-            if code in (-2012, -2010, -2041):
+            if code in (-2012, -2010):
                 return "invalid", "微信读书 Token/Cookie 已失效，请重新扫码"
+            if code == -2041:
+                return "unknown", "微信读书书架接口拒绝请求（-2041），不能据此判断 Token 失效"
             if code != 0:
                 return "unknown", f"微信读书检查返回错误（{code}）"
             return "valid", "微信读书 Token 有效"
@@ -314,7 +316,7 @@ class MpsWereadMP(MpsWeread):
         CallBack=None,
         Item_Over_CallBack=None,
     ) -> int:
-        """兜底方案：通过 /api/mp/cover 只采集最新一篇文章。"""
+        """通过新版 /api/mp/cover 接口只采集公众号最新一篇文章。"""
         cover = self._get_mp_cover(book_id)
         review_id = (cover.get("reviewId") or "").strip()
         title = (cover.get("title") or "").strip()
@@ -482,12 +484,11 @@ class MpsWereadMP(MpsWeread):
         Item_Over_CallBack=None,
         Over_CallBack=None,
     ):
-        """Collect one existing WeChat feed without changing its RSS identity.
+        """Collect only the latest WeChat feed article without changing its RSS identity.
 
-        主路径走 ``/web/mp/articles`` 列表接口做增量补抓：从最新一页开始翻页，
-        采集所有尚未入库的文章，遇到已入库文章即停止（上一轮到这一轮之间漏采的
-        文章会一并补齐）。列表接口不可用（如 -2012 登录超时 / -2041 等）时回退到
-        ``/api/mp/cover`` 只取最新一篇的兜底逻辑，保证采集不中断。
+        使用新版 ``/api/mp/cover``，仅取公众号最新一篇，不依赖旧文章列表接口
+        ``/web/mp/articles`` 或 ``x-wr-ticket``。因此两次任务之间发布多篇时，
+        中间文章不会补抓；相同的最新文章会通过数据库去重。
         """
         self.articles = []
         self.aids = []
@@ -528,39 +529,16 @@ class MpsWereadMP(MpsWeread):
 
         gather_content = bool(Gather_Content or self.Gather_Content)
 
-        print_info(f"微信读书公众号采集模式: {Mps_title} ({book_id})")
+        print_info(f"微信读书公众号采集模式（仅最新文章）: {Mps_title} ({book_id})")
         try:
-            try:
-                latest_publish_time = self._collect_via_article_list(
-                    book_id,
-                    Mps_id,
-                    Mps_title,
-                    gather_content,
-                    start_page,
-                    MaxPage,
-                    CallBack=CallBack,
-                    Item_Over_CallBack=Item_Over_CallBack,
-                )
-            except WereadMPAPIError as exc:
-                if str(exc.code) in {"-2012", "-2010", "-2041", "429"}:
-                    # Authentication failure/rate limiting is terminal for this
-                    # feed; do not issue a second WeRead request to the cover API.
-                    raise
-                if self.response_valid:
-                    # 列表接口本身可用（已成功翻页），属于正文缺失或补抓不完整
-                    # 等真实错误，直接上抛，下次任务重试。
-                    raise
-                print_warning(
-                    f"[{Mps_title}] 文章列表接口不可用({exc})，回退到仅取最新一篇"
-                )
-                latest_publish_time = self._collect_latest_via_cover(
-                    book_id,
-                    Mps_id,
-                    Mps_title,
-                    gather_content,
-                    CallBack=CallBack,
-                    Item_Over_CallBack=Item_Over_CallBack,
-                )
+            latest_publish_time = self._collect_latest_via_cover(
+                book_id,
+                Mps_id,
+                Mps_title,
+                gather_content,
+                CallBack=CallBack,
+                Item_Over_CallBack=Item_Over_CallBack,
+            )
 
             self.update_mps(
                 Mps_id,

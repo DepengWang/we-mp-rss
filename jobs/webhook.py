@@ -11,6 +11,7 @@ from core.config import cfg
 from bs4 import BeautifulSoup
 from core.content_format import format_content
 import re
+from urllib.parse import urlparse
 @dataclass
 class MessageWebHook:
     task: MessageTask
@@ -396,10 +397,45 @@ def call_webhook(hook: MessageWebHook, is_test: bool = False) -> str:
                 key, value = cookie_pair.split('=', 1)
                 cookies[key.strip()] = value.strip()
 
+    # 企业微信群机器人要求 msgtype/markdown.content JSON 包装；不能把模板文本
+    # 直接作为 JSON 请求体发送。其接口可能以 HTTP 200 返回 errcode 错误，
+    # 因此必须检查响应体后才能报告发送成功。
+    webhook_url = hook.task.web_hook_url
+    parsed_webhook_url = urlparse(webhook_url)
+    is_wecom_bot = (
+        parsed_webhook_url.hostname == "qyapi.weixin.qq.com"
+        and parsed_webhook_url.path.rstrip("/") == "/cgi-bin/webhook/send"
+    )
+
+    if is_wecom_bot:
+        headers["Content-Type"] = "application/json"
+        try:
+            response = requests.post(
+                webhook_url,
+                json={"msgtype": "markdown", "markdown": {"content": payload}},
+                headers=headers,
+                cookies=cookies,
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            # Request exceptions can include the secret webhook key in the URL.
+            raise ValueError(f"企微 Webhook 请求失败（{type(e).__name__}）") from e
+
+        try:
+            result = response.json()
+        except ValueError as e:
+            raise ValueError("企微 Webhook 返回了无法解析的响应") from e
+
+        if not isinstance(result, dict) or result.get("errcode") not in (0, "0"):
+            errcode = result.get("errcode", "missing") if isinstance(result, dict) else "invalid_response"
+            raise ValueError(f"企微 Webhook 拒绝消息（errcode={errcode}）")
+        return "企微 Webhook 已接受消息"
+
     # print_success(f"发送webhook请求{payload}")
     try:
         response = requests.post(
-            hook.task.web_hook_url,
+            webhook_url,
             data=payload,
             headers=headers,
             cookies=cookies,

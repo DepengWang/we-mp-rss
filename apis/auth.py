@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from datetime import timedelta
 import time
+import re
 from core.auth import (
     authenticate_user,
     create_access_token,
@@ -31,6 +32,25 @@ router = APIRouter(prefix=f"/auth", tags=["认证"])
 from driver.success import Success
 from driver.wx_api import get_qr_code #通过API登录
 from driver.wx import WX_API
+
+
+def _safe_qr_preflight_error(error):
+    """Keep useful preflight diagnostics without logging credentials."""
+    detail = str(error)
+    detail = re.sub(r"(?i)cookie:\s*[^\r\n]+", "Cookie: [REDACTED]", detail)
+    detail = re.sub(
+        r"(?i)https?://[^\s]+",
+        lambda match: re.sub(r"\?.*$", "?[REDACTED]", match.group(0)),
+        detail,
+    )
+    detail = re.sub(
+        r"(?i)\b(token|cookie|authorization|access_token|refresh_token|ticket|password)\b\s*[:=]\s*['\"]?[^\s,;&'\"]+",
+        r"\1=[REDACTED]",
+        detail,
+    )
+    return detail[:500]
+
+
 def ApiSuccess(data):
     if data != None:
             print("\n登录结果:")
@@ -46,6 +66,11 @@ async def get_qrcode(current_user=Depends(get_current_user)):
         # replace the single global token_data record.
         await WX_API.preserve_active_account_before_qr_login()
     except Exception as e:
+        from core.print import print_error
+        print_error(
+            f"扫码前公众号授权保全失败 [{type(e).__name__}]: "
+            f"{_safe_qr_preflight_error(e)}"
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"保全当前公众号授权失败，本次未启动扫码：{e}",
@@ -580,7 +605,6 @@ async def wx_account_status(current_user: dict = Depends(get_current_user)):
         return 0.0
 
     accounts.sort(key=lambda item: (bool(item.get("is_active")), account_recency(item)), reverse=True)
-    accounts = accounts[:3]
 
     return success_response({
         "accounts": accounts,
@@ -670,6 +694,7 @@ async def refresh_wx_account_status(current_user: dict = Depends(get_current_use
 async def switch_wechat_account(
     current_user: dict = Depends(get_current_user),
     account_id: str = Query(..., min_length=1),
+    account_name: str = Query("", max_length=120),
 ):
     """
     按后台账号列表中的 account_id 切换公众号，立即返回 job_id。
@@ -701,6 +726,38 @@ async def switch_wechat_account(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=error_response(code=40001, message="必须指定目标公众号 account_id"),
         )
+    account_name = account_name.strip()
+    if account_name:
+        from driver.token import get_account_status_data
+
+        cached_accounts = get_account_status_data().get("accounts", [])
+        name_matches = [
+            item for item in cached_accounts
+            if isinstance(item, dict)
+            and str(item.get("name") or "").strip() == account_name
+            and str(item.get("account_id") or "").strip()
+        ]
+        if len(name_matches) != 1:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=error_response(
+                    code=40901,
+                    message=(
+                        f"账号名称“{account_name}”在最近状态缓存中无法唯一匹配；"
+                        "请先刷新账号状态，再重试切换"
+                    ),
+                ),
+            )
+        resolved_account_id = str(name_matches[0]["account_id"]).strip()
+        if resolved_account_id != account_id:
+            from core.print import print_warning
+
+            print_warning(
+                f"账号切换请求名称/ID不一致：名称={account_name}，请求ID={account_id}，"
+                f"按缓存名称映射到ID={resolved_account_id}"
+            )
+            account_id = resolved_account_id
+
     job = manager.create_job(user_id=str(user_id), target_username=account_id)
     manager.update(job.job_id, stage="queued", message=f"已入队，准备切换到账号 {account_id}", progress=0)
 

@@ -170,7 +170,7 @@
               </div>
             </div>
             <div v-else-if="account.account_id" class="account-session-missing">
-              尚无完整可恢复会话；重新扫码授权后会自动保存，或手动刷新账号状态补齐。
+              当前未保存在最近 3 套可恢复会话中；账号状态仍来自微信侧扫描，缓存 Token 不可查看。
             </div>
           </template>
           <div v-else class="account-row-empty">暂无第 {{ index + 1 }} 个账号；刷新时会保留此行框架</div>
@@ -179,7 +179,7 @@
 
       <div class="account-status-actions">
         <span class="account-rotation-hint">
-          扫码授权成功后自动保存当前账号的 talking/token 与 Cookie，并保留最近三个有效账号；普通采集任务按有效 account_id 顺序轮转，微信读书模式不切换公众号账号。
+          微信侧扫描到的公众号/服务号都会显示；可恢复的 talking/token 与 Cookie 仍只保留最近三个有效账号。普通采集任务按有效 account_id 顺序轮转，微信读书模式不切换公众号账号。
         </span>
         <a-button type="primary" :loading="refreshingAccounts" :disabled="switching" @click="refreshAccountStatuses">
           <template #icon><icon-refresh /></template>
@@ -355,7 +355,7 @@ const switchAccount = async (account: any) => {
   accountSwitchProgress.value = 0
   accountSwitchMessage.value = `准备切换到 ${account.name || accountId}…`
   try {
-    const job = await switchWxAccount(accountId)
+    const job = await switchWxAccount(accountId, String(account?.name || '').trim())
     const completed = await waitForAccountJob(job, status => {
       accountSwitchProgress.value = Number(status?.progress) || 0
       accountSwitchMessage.value = status?.message || '正在切换公众号账号…'
@@ -540,20 +540,19 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  align-items: stretch;
 }
 
 .account-row {
-  width: calc(100% - 32px);
+  width: auto;
+  align-self: stretch;
   min-height: 88px;
   box-sizing: border-box;
+  margin: 0;
   padding: 16px 20px;
   border: 1px solid #e5e6eb;
   border-radius: 10px;
   background: #fff;
-}
-
-.account-row:nth-child(even) {
-  align-self: flex-end;
 }
 
 .account-row--active {
@@ -660,6 +659,18 @@ onUnmounted(() => {
   gap: 12px;
 }
 
+.account-row-heading {
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.account-row-heading > div:first-child {
+  min-width: 0;
+  flex: 1 1 auto;
+  margin-left: 0;
+  text-align: left;
+}
+
 .account-token-value {
   margin-top: 10px;
   padding: 10px;
@@ -699,10 +710,6 @@ onUnmounted(() => {
 
   .account-row {
     width: 100%;
-  }
-
-  .account-row:nth-child(even) {
-    align-self: stretch;
   }
 
   .account-row-heading,

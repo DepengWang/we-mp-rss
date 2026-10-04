@@ -165,32 +165,40 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                             web_status = "not_used" if collection_method.startswith("weread_") else "success"
                         except Exception as collection_error:
                             last_error = getattr(wx, "last_error", {}) or {}
-                            if str(last_error.get("code")) in {"-2012", "-2010", "-2041"}:
+                            if str(last_error.get("code")) in {"-2012", "-2010"}:
                                 weread_status = "invalid"
                                 tracker.mark_weread_invalid(
                                     task.id,
                                     "微信读书 Token 在本批采集中失效，后续订阅源将跳过微信读书采集",
                                 )
-                            if getattr(wx, "collection_limited", False):
-                                # A rate-limit response is terminal for this feed:
-                                # no retries, alternate endpoints, or WeRead fallback.
-                                limited = True
+                            source_was_rate_limited = getattr(wx, "collection_limited", False)
+                            if source_was_rate_limited:
                                 if collection_method.startswith("weread_"):
+                                    limited = True
                                     weread_status = "rate_limited"
                                     web_status = "not_used"
-                                else:
-                                    web_status = "limited"
-                                raise collection_error
-                            web_status = "not_used" if collection_method.startswith("weread_") else "failed"
+                                    raise collection_error
+                                # Do not retry Web or alternate Web endpoints after
+                                # rate limiting. A valid WeRead token may get one
+                                # independent fallback attempt below.
+                                web_status = "limited"
+                            else:
+                                web_status = "not_used" if collection_method.startswith("weread_") else "failed"
                             if gather_model != "web" or not is_weread_feed:
+                                limited = source_was_rate_limited
                                 raise collection_error
                             weread_state = tracker.get_weread_state(task.id)
                             weread_status = weread_state["status"]
                             if weread_status != "valid":
+                                limited = source_was_rate_limited
                                 weread_status = f"skipped_{weread_state['status']}"
                                 raise RuntimeError(
                                     f"Web 采集失败；微信读书兜底未执行（{weread_state['message']}）"
                                 ) from collection_error
+                            # Once WeRead is actually attempted, classify an
+                            # ordinary fallback failure as failed; only a WeRead
+                            # rate limit remains a rate-limited terminal result.
+                            limited = False
                             from core.wx.model.weread_mp import MpsWereadMP
                             fallback_wx = MpsWereadMP()
                             weread_status = "attempted"
@@ -214,7 +222,7 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                                     limited = True
                                     weread_status = "rate_limited"
                                     error_msg = getattr(fallback_wx, "collection_error", "微信读书采集触发频率限制")
-                                elif str(last_error.get("code")) in {"-2012", "-2010", "-2041"}:
+                                elif str(last_error.get("code")) in {"-2012", "-2010"}:
                                     weread_status = "invalid"
                                     tracker.mark_weread_invalid(
                                         task.id,

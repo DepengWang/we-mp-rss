@@ -134,6 +134,7 @@ class PlaywrightController:
             # 微信公众平台在 Windows 本地 Chrome 下经常触发反爬（QR 加载超时），
             # 此时设置 BROWSER_TYPE=webkit 可绕过。
             _forced_browser = os.environ.get("BROWSER_TYPE", "").strip().lower()
+            CHROME_PATH = None
             if _forced_browser in ("webkit", "chromium", "firefox", "msedge"):
                 self.browser_type = _forced_browser
                 print_info(f"通过 BROWSER_TYPE 强制使用浏览器: {self.browser_type}")
@@ -145,6 +146,25 @@ class PlaywrightController:
 
             # 选择浏览器类型
             browser_launcher = getattr(self._playwright, self.browser_type)
+            browser_executable = getattr(browser_launcher, "executable_path", None)
+            if browser_executable and not os.path.exists(browser_executable):
+                requested_browser = self.browser_type
+                browser_launcher = None
+                for fallback_browser in ("webkit", "chromium"):
+                    candidate = getattr(self._playwright, fallback_browser)
+                    candidate_executable = getattr(candidate, "executable_path", None)
+                    if candidate_executable and os.path.exists(candidate_executable):
+                        self.browser_type = fallback_browser
+                        browser_launcher = candidate
+                        print_warning(
+                            f"配置的 {requested_browser} 浏览器未安装，"
+                            f"自动回退到已安装的 {fallback_browser}"
+                        )
+                        break
+                if browser_launcher is None:
+                    raise RuntimeError(
+                        f"配置的 {requested_browser} 浏览器未安装，且没有可用的 WebKit/Chromium 回退"
+                    )
 
             # 启动浏览器
             # 注意：不同浏览器支持的参数不同

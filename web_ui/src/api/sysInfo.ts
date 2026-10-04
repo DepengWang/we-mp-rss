@@ -27,8 +27,10 @@ export const refreshWxAccountStatuses = async (): Promise<any> => {
   return await http.post('/wx/auth/accounts/refresh')
 }
 
-export const switchWxAccount = async (accountId: string): Promise<any> => {
-  return await http.post('/wx/auth/switch', null, { params: { account_id: accountId } })
+export const switchWxAccount = async (accountId: string, accountName = ''): Promise<any> => {
+  return await http.post('/wx/auth/switch', null, {
+    params: { account_id: accountId, account_name: accountName }
+  })
 }
 
 export const getWxAccountStatusJob = async (jobId: string): Promise<any> => {

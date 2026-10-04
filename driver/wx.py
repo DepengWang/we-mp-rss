@@ -98,7 +98,10 @@ class Wx:
             raise RuntimeError("公众号后台页面不可用")
 
         dialog = page.locator(".switch-account-dialog").first
-        if await dialog.count() and await dialog.is_visible():
+        # The switcher is rendered in a side-panel portal: its root can have
+        # zero height while the account sections themselves are visible.
+        visible_sections = page.locator(".switch-account-dialog_section:visible")
+        if await visible_sections.count():
             return dialog
 
         account_info = page.locator(".weui-desktop-account__info").first
@@ -111,53 +114,95 @@ class Wx:
         switch_link = account_panel.locator(
             "li.account_box-panel-item:has-text('切换账号') a"
         ).first
-        if not await switch_link.count():
-            raise RuntimeError("未找到公众号后台的切换账号入口")
+        try:
+            await switch_link.wait_for(state="visible", timeout=5000)
+        except Exception as e:
+            raise RuntimeError("公众号后台账号面板已打开，但切换账号入口未加载") from e
         await switch_link.click()
-        await dialog.wait_for(state="visible", timeout=10000)
+        await visible_sections.first.wait_for(state="visible", timeout=10000)
         return dialog
 
     async def _close_account_switch_dialog(self):
         page = self.controller.page
         if page is None:
             return
-        dialog = page.locator(".switch-account-dialog").first
-        if not await dialog.count() or not await dialog.is_visible():
+        visible_sections = page.locator(".switch-account-dialog_section:visible")
+        if not await visible_sections.count():
             return
         try:
             await page.keyboard.press("Escape")
-            await dialog.wait_for(state="hidden", timeout=2000)
+            await visible_sections.first.wait_for(state="hidden", timeout=2000)
         except Exception:
             pass
 
     async def _read_account_switch_entries(self):
         """Read all accounts shown by the platform switcher, including the active one."""
         page = self.controller.page
-        rows = self._account_rows_locator(page)
+        account_groups = await page.evaluate("""() => {
+            const response = window.MP_ACCOUNT_BOX?.switchAccountResp || {};
+            const normalize = (group) => Array.isArray(group?.list)
+                ? group.list.map(item => ({
+                    name: String(item.nickname || '').trim(),
+                    account_id: String(item.username || item.bizuin || '').trim(),
+                }))
+                : [];
+            return {
+                '公众号': normalize(response.biz_list),
+                '服务号': normalize(response.service_biz_list),
+            };
+        }""")
+        sections = page.locator(".switch-account-dialog_section")
         entries = []
         seen_ids = set()
-        for index in range(await rows.count()):
-            row = rows.nth(index)
-            try:
+        selector_index = 0
+        for section_index in range(await sections.count()):
+            section = sections.nth(section_index)
+            title = str(
+                await section.locator(".switch-account-dialog_section-title").text_content() or ""
+            ).strip()
+            group = account_groups.get(title)
+            if group is None:
+                continue
+
+            rows = section.locator(".section-item")
+            row_count = await rows.count()
+            if row_count != len(group):
+                raise RuntimeError(
+                    f"{title}页面条目数与授权数据不一致：页面 {row_count} 条，后台 {len(group)} 条"
+                )
+
+            used_group_indexes = set()
+            for row_index in range(row_count):
+                row = rows.nth(row_index)
+                name = str(
+                    await row.locator(".section-item__nickname").text_content() or ""
+                ).strip()
                 row_text = (await row.inner_text(timeout=5000) or "").strip()
-                account_id_locator = row.locator("p").first
-                name_locator = row.locator(".section-item__nickname").first
-                if not await account_id_locator.count() or not await name_locator.count():
-                    continue
-                account_id = (await account_id_locator.text_content(timeout=5000) or "").strip()
-                name = (await name_locator.text_content(timeout=5000) or "").strip()
-            except Exception as e:
-                print_warning(f"读取第 {index + 1} 个公众号账号条目失败，已跳过: {e}")
-                continue
-            if not account_id or not name or account_id in seen_ids:
-                continue
-            seen_ids.add(account_id)
-            entries.append({
-                "account_id": account_id,
-                "name": name,
-                "is_active": "当前登录" in row_text,
-                "selector_index": index,
-            })
+                candidates = [
+                    idx for idx, item in enumerate(group)
+                    if idx not in used_group_indexes and item.get("name") == name
+                ]
+                if len(candidates) == 1:
+                    group_index = candidates[0]
+                elif row_index not in used_group_indexes and group[row_index].get("name") == name:
+                    group_index = row_index
+                else:
+                    raise RuntimeError(f"{title}账号名称无法与后台授权数据唯一对应")
+
+                used_group_indexes.add(group_index)
+                account_id = str(group[group_index].get("account_id") or "").strip()
+                if not name or not account_id:
+                    raise RuntimeError(f"{title}账号条目缺少名称或稳定账号 ID")
+                if account_id in seen_ids:
+                    raise RuntimeError(f"{title}账号数据包含重复 ID，拒绝切换到不确定账号")
+                seen_ids.add(account_id)
+                entries.append({
+                    "account_id": account_id,
+                    "name": name,
+                    "is_active": "当前登录" in row_text,
+                    "selector_index": selector_index,
+                })
+                selector_index += 1
         return entries
 
     async def _switch_to_account_entry(self, target):
@@ -171,7 +216,7 @@ class Wx:
         selected = matches[0]
         if not selected["is_active"]:
             row = self._account_rows_locator(page).nth(selected["selector_index"])
-            await row.locator("p").first.click()
+            await row.click()
             try:
                 await page.wait_for_load_state("networkidle", timeout=12000)
             except Exception:
@@ -247,8 +292,12 @@ class Wx:
                 f"页面当前为“{actual_name or '未知'}”"
             )
         await self._persist_active_account_session(account_id)
-        if not await self.Token(isClose=False):
-            raise RuntimeError(f"账号 {account_id} 的缓存会话无法通过公众号授权校验")
+        account_status = await self._capture_account_status({
+            "account_id": account_id,
+            "name": expected_name or cached.get("name") or actual_name,
+        })
+        if account_status.get("token_status") != "valid":
+            raise RuntimeError(f"账号 {account_id} 的缓存 Token 无效或已过期")
 
         await self._open_account_switch_dialog()
         entries = await self._read_account_switch_entries()
@@ -618,6 +667,7 @@ class Wx:
             set_account_status_data,
             set_account_sessions_data,
         )
+        from driver.account_sessions import is_restorable_account_session
 
         def report(stage, message, progress=0):
             if progress_callback is not None:
@@ -701,21 +751,33 @@ class Wx:
                         raise RuntimeError("当前激活公众号与切换列表不一致，已中止扫描")
                 snapshot = await self._capture_account_status(entry)
                 saved_session = snapshot.pop("session", {})
-                snapshots.append(snapshot)
-                # Save each captured account immediately. A later scan/restore error
-                # must not discard already refreshed sessions or other cached IDs.
                 saved_sessions = get_account_sessions_data()
-                previous_session = saved_sessions.get(entry["account_id"], {}) or {}
-                saved_session["authorized_at"] = (
-                    previous_session.get("authorized_at") or time.time()
-                )
-                saved_session["last_active_at"] = (
-                    previous_session.get("last_active_at") or saved_session["authorized_at"]
-                )
-                saved_sessions[entry["account_id"]] = saved_session
+                if (
+                    snapshot.get("token_status") == "valid"
+                    and is_restorable_account_session(saved_session)
+                ):
+                    # Keep summaries for every valid discovered account, while the
+                    # credential writer independently retains only the newest three.
+                    previous_session = saved_sessions.get(entry["account_id"], {}) or {}
+                    saved_session["authorized_at"] = (
+                        previous_session.get("authorized_at") or time.time()
+                    )
+                    saved_session["last_active_at"] = (
+                        previous_session.get("last_active_at") or saved_session["authorized_at"]
+                    )
+                    saved_sessions[entry["account_id"]] = saved_session
+                    snapshots.append(snapshot)
+                    snapshot["authorized_at"] = saved_session["authorized_at"]
+                    snapshot["last_active_at"] = saved_session["last_active_at"]
+                else:
+                    # Drop expired/incomplete credentials instead of keeping a row
+                    # that cannot be restored or used for collection.
+                    saved_sessions.pop(entry["account_id"], None)
+                    print_warning(
+                        f"公众号 {entry['name']}（{entry['account_id']}）Token 无效或会话不完整，"
+                        "已从账号缓存中清理"
+                    )
                 set_account_sessions_data(saved_sessions)
-                snapshot["authorized_at"] = saved_session["authorized_at"]
-                snapshot["last_active_at"] = saved_session["last_active_at"]
 
             scan_complete = True
             report("restoring", f"账号状态已读取，正在恢复原账号“{original['name']}”…", 90)
@@ -751,11 +813,6 @@ class Wx:
                 if scan_complete and restore_ok and original is not None:
                     checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
                     try:
-                        retained_ids = set(get_account_sessions_data())
-                        snapshots = [
-                            item for item in snapshots
-                            if str(item.get("account_id") or "") in retained_ids
-                        ]
                         set_account_status_data({
                             "accounts": snapshots,
                             "active_account_id": original["account_id"],
@@ -767,7 +824,12 @@ class Wx:
                         print_error(scan_error)
                         report("failed", scan_error, 100)
                     else:
-                        report("done", f"已读取 {len(snapshots)} 个公众号，并恢复到“{original['name']}”", 100)
+                        report(
+                            "done",
+                            f"已扫描微信侧 {len(entries)} 个公众号/服务号，保留 {len(snapshots)} 个有效账号，"
+                            f"并恢复到“{original['name']}”",
+                            100,
+                        )
                 elif scan_complete and not restore_ok:
                     scan_error = "账号状态已读取，但未能恢复原激活公众号，请检查当前账号"
                     report("failed", scan_error, 100)
@@ -1022,19 +1084,24 @@ class Wx:
                 switch_attempted = True
                 await self._switch_to_account_entry(target)
             else:
-                report("restoring", f"切换列表不可用，正在恢复缓存账号：{target['name']}（{account_id}）…", 70)
+                report(
+                    "restoring",
+                    f"后台在线切换列表暂不可用，正在尝试用缓存会话切换到："
+                    f"{target['name']}（{account_id}）…",
+                    70,
+                )
                 switch_attempted = True
                 await self._restore_cached_account_session(account_id, target.get("name", ""))
 
             report("checking_token", "确认目标账号授权并保存当前会话…", 85)
             session_data = await self._persist_active_account_session(account_id)
-            if not await self.Token(isClose=False):
-                raise RuntimeError("切换后的公众号登录状态校验失败")
             session_data = self.ext_data or session_data
             if str((session_data or {}).get("wx_app_name") or "").strip() != target["name"]:
                 raise RuntimeError("当前公众号名称与所选目标账号不一致")
 
             account_status = await self._capture_account_status(target)
+            if account_status.get("token_status") != "valid":
+                raise RuntimeError("切换后的公众号 Token 无效或已过期")
             from driver.token import update_account_session_data
             session_snapshot = account_status.pop("session", {})
             update_account_session_data(account_id, session_snapshot)
@@ -1738,12 +1805,15 @@ class Wx:
                             "并保留最近三个有效会话"
                         )
                     except Exception as e:
-                        self._last_qr_auth_error = (
-                            "扫码已完成，但未能确认新公众号 account_id；原授权已保留，"
-                            "本次未替换登录。请重试，或先手动刷新账号状态。"
+                        # QR login itself has already produced a new live token.
+                        # Do not discard it merely because the optional per-account
+                        # mapping could not be reconstructed (most notably when all
+                        # previously cached accounts are expired).  Persist the
+                        # global session below, while keeping the account-cache
+                        # failure visible for a later status refresh.
+                        print_warning(
+                            f"扫码账号会话缓存失败，先保存新的全局授权：{e}"
                         )
-                        print_error(f"扫码账号会话保存失败: {e}")
-                        raise RuntimeError(self._last_qr_auth_error) from e
                 Store.save(cookies)
                 from driver.token import set_token
                 set_token(self.SESSION, self.ext_data)
