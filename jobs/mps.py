@@ -316,6 +316,10 @@ from core.queue import TaskQueue
 # 任务执行追踪器
 class MessageTaskTracker:
     """消息任务执行追踪器"""
+    # 企微 markdown 消息有长度上限，文章按批推送
+    WEBHOOK_BATCH_SIZE = 5
+    # 企微群机器人每分钟最多 20 条，3 秒间隔刚好不超限
+    WEBHOOK_SEND_INTERVAL = 3
     _instance = None
     _lock = threading.Lock()
     
@@ -410,7 +414,6 @@ class MessageTaskTracker:
             # 检查是否全部完成
             should_finish = progress >= task_info['total'] and not task_info['finalizing']
             if should_finish:
-                task_info['webhook_sent'] = True
                 task_info['finalizing'] = True
 
         if should_finish:
@@ -472,9 +475,13 @@ class MessageTaskTracker:
                 'weread_message': weread_message,
             }
             try:
-                from jobs.webhook import MessageWebHook
-                web_hook(MessageWebHook(task=task, results=webhook_results, summary=summary))
-                print_success(f"消息任务 [{task_id}] 汇总Webhook发送完成")
+                all_sent = self._send_batched_webhooks(task_id, task, webhook_results, summary)
+                if all_sent:
+                    with self._task_lock:
+                        current = self._tasks.get(task_id)
+                        if current:
+                            current['webhook_sent'] = True
+                    print_success(f"消息任务 [{task_id}] 分批Webhook发送完成")
             except Exception as e:
                 print_error(f"消息任务 [{task_id}] 汇总Webhook发送失败: {e}")
         finally:
@@ -483,6 +490,86 @@ class MessageTaskTracker:
                 if current:
                     current['finished'] = True
     
+    @staticmethod
+    def _build_article_results(entries) -> list:
+        """把 (源结果, 文章) 列表按公众号重新分组，生成本批次的 results。"""
+        grouped = {}
+        ordered = []
+        for source_result, article in entries:
+            key = id(source_result)
+            batch_result = grouped.get(key)
+            if batch_result is None:
+                batch_result = dict(source_result)
+                batch_result['articles'] = []
+                batch_result['article_count'] = 0
+                grouped[key] = batch_result
+                ordered.append(batch_result)
+            batch_result['articles'].append(article)
+            batch_result['article_count'] += 1
+        for batch_result in ordered:
+            titles = [
+                str((article.get('title') if isinstance(article, dict) else getattr(article, 'title', '')) or '')
+                for article in batch_result['articles']
+            ]
+            batch_result['message'] = '；'.join(titles)
+        return ordered
+
+    def _send_batched_webhooks(self, task_id: str, task, webhook_results: list, summary: dict) -> bool:
+        """按每批 WEBHOOK_BATCH_SIZE 篇文章分批推送，最后发送一条汇总。
+
+        汇总包含最后不足一批的文章，以及所有没有文章的订阅源（失败、频率限制、
+        成功但无新文章），保证用户每轮都能收到完整的执行状态。
+        单批失败不会中断后续批次；全部发送成功时返回 True。
+        """
+        from jobs.webhook import MessageWebHook
+
+        # 只把成功订阅源的文章拆进批次；失败项保留原样进入汇总。
+        article_batches = []
+        pending_articles = []
+        for result in webhook_results:
+            if not result.get('success'):
+                continue
+            for article in result.get('articles') or []:
+                pending_articles.append((result, article))
+                if len(pending_articles) == self.WEBHOOK_BATCH_SIZE:
+                    article_batches.append(pending_articles)
+                    pending_articles = []
+
+        messages = []
+        for batch_index, entries in enumerate(article_batches, start=1):
+            batch_summary = dict(summary)
+            batch_summary['new_articles'] = len(entries)
+            messages.append((
+                f"文章推送 {batch_index}/{len(article_batches)}（{len(entries)} 篇）",
+                self._build_article_results(entries),
+                batch_summary,
+            ))
+
+        summary_results = self._build_article_results(pending_articles)
+        summary_results.extend(
+            item for item in webhook_results
+            if not item.get('success') or not item.get('articles')
+        )
+        if summary_results:
+            final_summary = dict(summary)
+            final_summary['new_articles'] = len(pending_articles)
+            messages.append(("汇总", summary_results, final_summary))
+
+        failed = 0
+        for index, (label, results, batch_summary) in enumerate(messages):
+            if index > 0:
+                # 企微群机器人限制每分钟 20 条，批次间留出间隔避免 errcode 45009。
+                time.sleep(self.WEBHOOK_SEND_INTERVAL)
+            try:
+                web_hook(MessageWebHook(task=task, results=results, summary=batch_summary))
+                print_success(f"消息任务 [{task_id}] {label} 发送完成")
+            except Exception as e:
+                failed += 1
+                print_error(f"消息任务 [{task_id}] {label} 发送失败: {e}")
+        if failed:
+            print_warning(f"消息任务 [{task_id}] Webhook 共 {len(messages)} 条，失败 {failed} 条")
+        return failed == 0
+
     def get_task_status(self, task_id: str) -> dict:
         """获取任务状态"""
         with self._task_lock:
