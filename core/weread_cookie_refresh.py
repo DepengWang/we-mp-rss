@@ -76,19 +76,50 @@ def _load_weread_data(lic_path: str = DEFAULT_LIC_PATH):
     return doc, data
 
 
+def _primary_account(data: dict) -> dict:
+    """返回当前用于采集的主账号。
+
+    多账号格式取 ``accounts[0]``（与 MpsWeread._load_weread_auth 一致）；
+    旧版单账号格式直接使用 weread_data 顶层字段。
+    浏览器 profile 只有一份，保活线程也只维护这一个账号。
+    """
+    accounts = data.get("accounts")
+    if isinstance(accounts, list) and accounts and isinstance(accounts[0], dict):
+        return accounts[0]
+    return data
+
+
 def _save_cookie(cookie: str, name: str = "", lic_path: str = DEFAULT_LIC_PATH):
     """把最新 cookie 写回 wx.lic 的 weread_data（保留文档其他部分）。
 
-    同时同步 vid 字段：配置页与 /weread 状态接口用 weread_data.vid 判断是否已配置，
+    同时同步 vid 字段：配置页与 /weread 状态接口用 vid 判断是否已配置，
     若只更新 cookie 而不更新 vid，换账号扫码后会残留上一个账号的 vid。
+    多账号格式按 vid 更新 ``accounts`` 中对应账号，找不到时追加，
+    与扫码授权的写入规则保持一致；旧版单账号格式仍写顶层字段。
     """
     doc, data = _load_weread_data(lic_path)
-    data["cookie"] = cookie
     vid = extract_vid(cookie)
-    if vid:
-        data["vid"] = vid
-    if name:
-        data["name"] = name
+    accounts = data.get("accounts")
+    if isinstance(accounts, list) and accounts:
+        target = next(
+            (acc for acc in accounts
+             if isinstance(acc, dict) and vid and str(acc.get("vid", "")) == vid),
+            None,
+        )
+        if target is None:
+            target = {"cookie": "", "vid": vid, "name": ""}
+            accounts.append(target)
+        target["cookie"] = cookie
+        if vid:
+            target["vid"] = vid
+        if name and not target.get("name"):
+            target["name"] = name
+    else:
+        data["cookie"] = cookie
+        if vid:
+            data["vid"] = vid
+        if name:
+            data["name"] = name
     data["cookie_refresh_last_ts"] = time.time()
     doc["weread_data"] = data
     _write_lic(lic_path, doc)
@@ -108,7 +139,7 @@ def _save_cookie_if_changed(cookie: str, previous_cookie: str, name: str = "",
                             lic_path: str = DEFAULT_LIC_PATH) -> bool:
     """仅在服务端轮换且文件未被扫码流程更新时写回。"""
     _, current_data = _load_weread_data(lic_path)
-    current_cookie = (current_data.get("cookie") or "").strip()
+    current_cookie = (_primary_account(current_data).get("cookie") or "").strip()
     current_signature = _cookie_signature(current_cookie)
     if _cookie_signature(cookie) == current_signature:
         return False
@@ -271,6 +302,9 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
     cooldown_hours: 距离上次成功刷新不足该时长且已有 Cookie 时，视为仍有效，跳过刷新。
     """
     lic, data = _load_weread_data()
+    account = _primary_account(data)
+    current_cookie = (account.get("cookie") or "").strip()
+    current_name = account.get("name", "")
     url = (data.get("cookie_refresh_url") or "").strip()
     browser_path = (data.get("browser_path") or "").strip()
     browser_type = (data.get("browser_type") or "chrome").strip() or "chrome"
@@ -283,11 +317,11 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
     # 冷却：上次刷新成功且在冷却期内，且已有 Cookie，则视为仍有效，跳过
     if cooldown_hours and cooldown_hours > 0:
         last_ts = data.get("cookie_refresh_last_ts") or 0
-        has_cookie = bool((data.get("cookie") or "").strip())
+        has_cookie = bool(current_cookie)
         if has_cookie and last_ts and (time.time() - float(last_ts)) < cooldown_hours * 3600:
             # 冷却期内：只有经真实接口验证 Cookie 仍有效才跳过刷新；
             # 否则（已过期 / 旧时间戳是假阳性）必须强制刷新，不能被旧时间戳卡住。
-            if _verify_cookie((data.get("cookie") or "").strip()):
+            if _verify_cookie(current_cookie):
                 if verbose:
                     print(f"[refresh] Cookie 在冷却期内（{cooldown_hours:g}h）且仍有效，跳过刷新")
                 return True
@@ -392,12 +426,12 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
 
     # 1) 常规无头刷新：登录态持久化，通常直接拿到有效 Cookie
     #    注入 wx.lic 已有 Cookie 作为种子（跨平台 profile 不互通时的可信回退）
-    seed_cookie = (data.get("cookie") or "").strip()
+    seed_cookie = current_cookie
     cookie = _try(headless=True, force_bundled=force_bundled, seed_cookie=seed_cookie)
     # 必须实打实验证 Cookie 真能拉到数据，避免把过期 Cookie 误判为有效（假阳性）
     if cookie and "wr_vid=" in cookie and _verify_cookie(cookie):
         vid = extract_vid(cookie)
-        if _save_cookie_if_changed(cookie, data.get("cookie", ""), name=data.get("name", "")):
+        if _save_cookie_if_changed(cookie, current_cookie, name=current_name):
             if verbose:
                 print(f"[refresh] Cookie 已自动轮换并保存 (vid={vid})")
         elif verbose:
@@ -419,7 +453,7 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
                  force_bundled=force_bundled, seed_cookie=seed_cookie)
     if cookie and "wr_vid=" in cookie and _verify_cookie(cookie):
         vid = extract_vid(cookie)
-        if _save_cookie_if_changed(cookie, data.get("cookie", ""), name=data.get("name", "")):
+        if _save_cookie_if_changed(cookie, current_cookie, name=current_name):
             if verbose:
                 print(f"[refresh] 扫码登录后 Cookie 已轮换并保存 (vid={vid})")
         elif verbose:
@@ -519,7 +553,9 @@ def start_weread_cookie_refresh_thread(interval_hours: float = 0.5) -> bool:
                         # 刷新尝试失败本身不代表 Cookie 失效。重新读取 wx.lic，
                         # 再用书架接口确认，避免把网络/浏览器故障误报为需要扫码。
                         _, latest_data = _load_weread_data()
-                        current_cookie = (latest_data.get("cookie") or "").strip()
+                        current_cookie = (
+                            _primary_account(latest_data).get("cookie") or ""
+                        ).strip()
                         cookie_status = (
                             _cookie_status(current_cookie) if current_cookie else "unknown"
                         )

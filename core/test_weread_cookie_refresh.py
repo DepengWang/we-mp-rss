@@ -14,6 +14,7 @@ except ModuleNotFoundError:
 from core.weread_cookie_refresh import (
     _cookie_status,
     _extract_cookie_from_page,
+    _save_cookie,
     _save_cookie_if_changed,
     _send_cookie_expired_notice,
 )
@@ -134,6 +135,61 @@ class WereadCookieRefreshTests(unittest.TestCase):
                 )
                 self.assertFalse(changed)
                 save_cookie.assert_not_called()
+
+
+class MultiAccountCookieSaveTests(unittest.TestCase):
+    """wx.lic 迁移到 weread_data.accounts[] 后，保活结果必须写回对应账号。"""
+
+    def _save(self, weread_data, cookie, name=""):
+        doc = {"weread_data": weread_data, "other": "kept"}
+        written = {}
+        with patch("core.weread_cookie_refresh._read_lic", return_value=doc), \
+                patch("core.weread_cookie_refresh._write_lic",
+                      side_effect=lambda path, d: written.update(d)):
+            _save_cookie(cookie, name=name, lic_path="unused.wx.lic")
+        return written
+
+    def test_updates_matching_account_instead_of_top_level(self):
+        written = self._save({
+            "cookie_refresh_url": "https://weread.qq.com/web/mp/reader/x",
+            "accounts": [
+                {"cookie": "wr_vid=1; wr_skey=old", "vid": "1", "name": "主号"},
+                {"cookie": "wr_vid=2; wr_skey=b", "vid": "2", "name": "备用"},
+            ],
+        }, "wr_vid=1; wr_skey=new", name="ignored")
+        data = written["weread_data"]
+        self.assertNotIn("cookie", data)
+        self.assertEqual(data["accounts"][0]["cookie"], "wr_vid=1; wr_skey=new")
+        self.assertEqual(data["accounts"][0]["name"], "主号")
+        self.assertEqual(data["accounts"][1]["cookie"], "wr_vid=2; wr_skey=b")
+        self.assertIn("cookie_refresh_last_ts", data)
+        self.assertEqual(written["other"], "kept")
+
+    def test_appends_account_when_vid_is_new(self):
+        written = self._save({
+            "accounts": [{"cookie": "wr_vid=1; wr_skey=a", "vid": "1", "name": ""}],
+        }, "wr_vid=3; wr_skey=c", name="新号")
+        accounts = written["weread_data"]["accounts"]
+        self.assertEqual(len(accounts), 2)
+        self.assertEqual(accounts[1], {"cookie": "wr_vid=3; wr_skey=c", "vid": "3", "name": "新号"})
+
+    def test_legacy_single_account_format_still_writes_top_level(self):
+        written = self._save({"cookie": "wr_vid=1; wr_skey=old", "vid": "1"},
+                             "wr_vid=1; wr_skey=new")
+        data = written["weread_data"]
+        self.assertEqual(data["cookie"], "wr_vid=1; wr_skey=new")
+        self.assertNotIn("accounts", data)
+
+    def test_change_detection_compares_primary_account(self):
+        current = {"accounts": [{"cookie": "wr_vid=1; wr_skey=old", "vid": "1"}]}
+        with patch("core.weread_cookie_refresh._load_weread_data",
+                   return_value=({}, current)), \
+                patch("core.weread_cookie_refresh._save_cookie") as save_cookie:
+            self.assertTrue(_save_cookie_if_changed(
+                "wr_vid=1; wr_skey=new", "wr_vid=1; wr_skey=old",
+                lic_path="unused.wx.lic",
+            ))
+            save_cookie.assert_called_once()
 
 
 if __name__ == "__main__":

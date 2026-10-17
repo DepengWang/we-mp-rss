@@ -26,8 +26,9 @@ class WereadConfigAPITest(unittest.TestCase):
         asyncio.run(save_weread_cookie(request, current_user={"id": "test"}))
 
         saved = save.call_args.args[0]
-        self.assertEqual(saved["vid"], "123")
-        self.assertEqual(saved["ticket"], "ticket-value")
+        self.assertEqual(saved["accounts"][0]["vid"], "123")
+        self.assertEqual(saved["accounts"][0]["ticket"], "ticket-value")
+        self.assertNotIn("cookie", saved)
 
     @patch("apis.weread.app_cfg.get")
     @patch("apis.weread._load_weread_data")
@@ -81,8 +82,11 @@ class WereadConfigAPITest(unittest.TestCase):
         asyncio.run(save_weread_cookie(request, current_user={"id": "test"}))
 
         saved = save.call_args.args[0]
-        self.assertEqual(saved["cookie"], "wr_vid=123; wr_skey=skey")
-        self.assertEqual(saved["ticket"], "new-ticket")
+        # 旧单账号格式迁移为 accounts[]，Cookie 沿用原值，只更新 ticket
+        self.assertEqual(len(saved["accounts"]), 1)
+        self.assertEqual(saved["accounts"][0]["cookie"], "wr_vid=123; wr_skey=skey")
+        self.assertEqual(saved["accounts"][0]["ticket"], "new-ticket")
+        self.assertNotIn("cookie", saved)
 
     @patch("apis.weread._save_weread_data")
     @patch("apis.weread._load_weread_data")
