@@ -1,1 +1,0 @@
-import{v as e}from"./http-1sl_U3GT.js";export{e as getArticles};

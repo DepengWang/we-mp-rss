@@ -1,0 +1,1 @@
+import{v as e}from"./http-Dc8BjeHV.js";export{e as getArticles};
