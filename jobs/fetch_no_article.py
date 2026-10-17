@@ -167,7 +167,7 @@ def start_sync_content():
         print_warning("自动检查并同步文章内容功能未启用")
         return
     interval=int(cfg.get("gather.content_auto_interval",10)) # 每隔多少分钟
-    cron_exp=f"*/{interval} * * * *"
+    cron_exp="0 * * * *" if interval == 60 else f"*/{interval} * * * *"
     # ContentTaskQueue.clear_queue()  # 已注释：避免清空消息任务队列
     scheduler.clear_all_jobs()
     def do_sync():
