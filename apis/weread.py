@@ -703,12 +703,18 @@ def weread_rescan_page(t: str = ""):
 def weread_rescan_qr(t: str = ""):
     """生成新的二维码并开始轮询。getLoginUid 为同步网络请求，必须用普通 def。"""
     import base64
-    from core.weread_rescan import verify_token
+    from core.weread_rescan import consume_token, verify_token
     if not verify_token(t):
         return {"ok": False, "msg": "链接已失效，请使用最新提醒中的链接", "retry": False}
 
+    def on_login_success(result: dict):
+        # 在服务端作废令牌：手机上点「在微信中确认登录」会跳离本页，
+        # 页面轮询停止，不能依赖状态接口来作废。
+        consume_token(t)
+        print("Weread QR（免登录链接）登录成功，Cookie 已自动保存，链接已作废")
+
     wr_qr = WereadQRLogin()
-    code_path = wr_qr.GetCode(CallBack=lambda result: print("Weread QR（免登录链接）登录成功，Cookie 已自动保存"))
+    code_path = wr_qr.GetCode(CallBack=on_login_success)
     if not code_path or not wr_qr._uid:
         return {"ok": False, "msg": "获取二维码失败，请稍后重试", "retry": True}
     try:

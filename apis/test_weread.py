@@ -41,6 +41,29 @@ class WereadRescanAPITest(unittest.TestCase):
         consume.assert_called_once_with("tok")
         self.assertNotIn("secret", str(result))
 
+    @patch("core.weread_rescan.consume_token")
+    @patch("core.weread_rescan.verify_token", return_value=True)
+    def test_login_callback_consumes_token_even_if_page_left(self, _verify, consume):
+        # 手机上点确认按钮会跳离页面，状态接口不再被调用；令牌必须在登录回调里作废
+        import tempfile, os
+        from apis.weread import weread_rescan_qr
+        png = os.path.join(tempfile.mkdtemp(), "qr.png")
+        with open(png, "wb") as f:
+            f.write(b"png")
+        captured = {}
+
+        class FakeQR:
+            _uid = "UID"
+            def GetCode(self, CallBack=None):
+                captured["cb"] = CallBack
+                return png
+
+        with patch("apis.weread.WereadQRLogin", FakeQR):
+            self.assertTrue(weread_rescan_qr("tok")["ok"])
+        consume.assert_not_called()
+        captured["cb"]({"succeed": True})
+        consume.assert_called_once_with("tok")
+
     @patch("core.weread_rescan.verify_token", return_value=True)
     def test_waiting_and_expired_states(self, _verify):
         from apis.weread import weread_rescan_status
