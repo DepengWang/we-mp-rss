@@ -18,6 +18,12 @@ from .cookies import expire
 import json
 import psutil
 from core.print import print_error,print_warning,print_info,print_success
+
+
+class CachedSessionInvalid(RuntimeError):
+    """缓存会话在服务端已确认失效（过期、恢复后未登录或 Token 无效），需重新扫码。"""
+
+
 class Wx:
     _haslogin=False
     SESSION=None
@@ -260,7 +266,7 @@ class Wx:
         expiry_timestamp = expiry.get("expiry_timestamp")
         try:
             if expiry_timestamp is not None and float(expiry_timestamp) <= time.time():
-                raise RuntimeError(f"账号 {account_id} 的缓存会话已过期，请重新扫码授权")
+                raise CachedSessionInvalid(f"账号 {account_id} 的缓存会话已过期，请重新扫码授权")
         except (TypeError, ValueError):
             pass
 
@@ -286,10 +292,14 @@ class Wx:
         actual = await self._extract_wechat_data()
         actual_name = str((actual or {}).get("wx_app_name") or "").strip()
         expected_name = str(expected_name or cached.get("name") or "").strip()
-        if not actual_name or (expected_name and actual_name != expected_name):
+        if not actual_name:
+            # 注入 Cookie 后仍读不到公众号名称：页面停在登录页，服务端会话已失效。
+            raise CachedSessionInvalid(
+                f"缓存会话恢复校验失败：期望“{expected_name or '未知'}”，页面当前为“未知”（未登录）"
+            )
+        if expected_name and actual_name != expected_name:
             raise RuntimeError(
-                f"缓存会话恢复校验失败：期望“{expected_name or '未知'}”，"
-                f"页面当前为“{actual_name or '未知'}”"
+                f"缓存会话恢复校验失败：期望“{expected_name}”，页面当前为“{actual_name}”"
             )
         await self._persist_active_account_session(account_id)
         account_status = await self._capture_account_status({
@@ -297,7 +307,7 @@ class Wx:
             "name": expected_name or cached.get("name") or actual_name,
         })
         if account_status.get("token_status") != "valid":
-            raise RuntimeError(f"账号 {account_id} 的缓存 Token 无效或已过期")
+            raise CachedSessionInvalid(f"账号 {account_id} 的缓存 Token 无效或已过期")
 
         await self._open_account_switch_dialog()
         entries = await self._read_account_switch_entries()
@@ -1103,7 +1113,13 @@ class Wx:
                     70,
                 )
                 switch_attempted = True
-                await self._restore_cached_account_session(account_id, target.get("name", ""))
+                try:
+                    await self._restore_cached_account_session(account_id, target.get("name", ""))
+                except CachedSessionInvalid as e:
+                    # 确认失效的会话不再参与自动轮转，避免每轮启动浏览器白白重试。
+                    from driver.token import mark_account_session_expired
+                    mark_account_session_expired(account_id, str(e))
+                    raise
 
             report("checking_token", "确认目标账号授权并保存当前会话…", 85)
             session_data = await self._persist_active_account_session(account_id)

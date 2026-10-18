@@ -259,6 +259,32 @@ def update_account_session_data(account_id: str, account: dict, active: bool = F
         set_account_sessions_data(sessions)
 
 
+def mark_account_session_expired(account_id: str, reason: str = "") -> None:
+    """Mark a cached account session as expired so automatic rotation skips it.
+
+    Called only when restoring the cached session proved it is invalid on the
+    server side; a fresh QR authorization records a valid status again.
+    """
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return
+    with _ACCOUNT_SESSIONS_LOCK:
+        sessions = get_account_sessions_data()
+        if account_id in sessions and isinstance(sessions[account_id], dict):
+            sessions[account_id] = {**sessions[account_id], "token_status": "expired"}
+            set_account_sessions_data(sessions)
+    status = get_account_status_data()
+    changed = False
+    for item in status.get("accounts", []):
+        if isinstance(item, dict) and str(item.get("account_id") or "") == account_id:
+            item["token_status"] = "expired"
+            item["checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            changed = True
+    if changed:
+        set_account_status_data(status)
+    print_warning(f"公众号账号 {account_id} 的缓存会话已失效，自动轮转将跳过它，重新扫码后恢复：{reason}")
+
+
 def record_authorized_account_session(
     account_id: str,
     account: dict,
