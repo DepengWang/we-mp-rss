@@ -39,19 +39,46 @@ def _wait_for_collection_queues_idle(timeout=180):
     return False
 
 
-def _run_account_rotation():
-    """Run browser account rotation in a dedicated loop, outside queue workers."""
+ACCOUNT_ROTATION_TIMEOUT = 300
+
+
+def _run_account_rotation(timeout=None):
+    """Run browser account rotation in a dedicated loop, outside queue workers.
+
+    Playwright 对象绑定在创建它的事件循环上。asyncio.run 结束后循环即关闭，
+    若浏览器留到下一轮，在新循环里操作旧页面会永久挂起，整轮采集随之卡死。
+    因此每次轮转都在同一循环内关闭浏览器，下一轮从缓存会话重新启动；
+    同时限制等待时间，超时就放弃轮转继续采集。
+    """
+    if timeout is None:
+        try:
+            timeout = max(30, int(os.getenv("ACCOUNT_ROTATION_TIMEOUT", ACCOUNT_ROTATION_TIMEOUT)))
+        except (TypeError, ValueError):
+            timeout = ACCOUNT_ROTATION_TIMEOUT
     outcome = {"ok": False}
+
+    async def rotate_and_close():
+        try:
+            return await WX_API.auto_rotate_account_by_id()
+        finally:
+            try:
+                await WX_API.Close()
+            except Exception as e:
+                print_warning(f"账号轮转后关闭浏览器失败：{e}")
 
     def run():
         try:
-            outcome["ok"] = bool(asyncio.run(WX_API.auto_rotate_account_by_id()))
+            outcome["ok"] = bool(asyncio.run(rotate_and_close()))
         except Exception as e:
             outcome["error"] = str(e)
 
     worker = threading.Thread(target=run, name="wechat-account-rotation", daemon=True)
     worker.start()
-    worker.join()
+    worker.join(timeout)
+    if worker.is_alive():
+        # 丢弃卡住的浏览器控制器，避免下一轮再在新循环里复用它。
+        WX_API.controller = None
+        return {"ok": False, "error": f"账号轮转超过 {timeout} 秒未完成，已放弃本轮轮转"}
     return outcome
 
 
