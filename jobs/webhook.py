@@ -9,8 +9,22 @@ from datetime import datetime
 from core.log import logger
 from core.config import cfg
 
-# 企微群机器人 markdown.content 上限 4096 字节（UTF-8），超出返回 errcode=40058。
+# 企微群机器人 markdown.content 上限 4096 字节、text.content 上限 2048 字节（UTF-8），
+# 超出返回 errcode=40058。
 WECOM_MARKDOWN_MAX_BYTES = 4096
+WECOM_TEXT_MAX_BYTES = 2048
+
+
+def _wecom_msgtype() -> tuple:
+    """企微群机器人消息类型及长度上限。
+
+    markdown 只能在企业微信中查看；text 在微信中也能查看，且文本里的
+    <a href> 会显示为可点击链接，模板需相应改为纯文本写法。
+    """
+    msgtype = str(cfg.get("webhook.wecom_msgtype", "markdown") or "markdown").strip().lower()
+    if msgtype == "text":
+        return "text", WECOM_TEXT_MAX_BYTES
+    return "markdown", WECOM_MARKDOWN_MAX_BYTES
 
 
 class WebhookPayloadTooLarge(ValueError):
@@ -429,16 +443,17 @@ def call_webhook(hook: MessageWebHook, is_test: bool = False) -> str:
     )
 
     if is_wecom_bot:
+        msgtype, max_bytes = _wecom_msgtype()
         payload_bytes = len(str(payload).encode("utf-8"))
-        if payload_bytes > WECOM_MARKDOWN_MAX_BYTES:
+        if payload_bytes > max_bytes:
             raise WebhookPayloadTooLarge(
-                f"企微消息 {payload_bytes} 字节，超过 {WECOM_MARKDOWN_MAX_BYTES} 字节上限"
+                f"企微{msgtype}消息 {payload_bytes} 字节，超过 {max_bytes} 字节上限"
             )
         headers["Content-Type"] = "application/json"
         try:
             response = requests.post(
                 webhook_url,
-                json={"msgtype": "markdown", "markdown": {"content": payload}},
+                json={"msgtype": msgtype, msgtype: {"content": payload}},
                 headers=headers,
                 cookies=cookies,
                 timeout=30,

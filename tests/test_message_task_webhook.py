@@ -263,6 +263,42 @@ class CompactListTest(unittest.TestCase):
         self.assertNotIn('兜底', out)
 
 
+class WecomMsgtypeTest(unittest.TestCase):
+    URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"
+
+    def _hook(self, template):
+        from jobs.webhook import MessageWebHook
+        task = type('Task', (), {'id': 't', 'name': '每两小时更新', 'message_type': 1, 'message_template': template,
+                                 'web_hook_url': self.URL, 'headers': '', 'cookies': ''})()
+        return MessageWebHook(task=task, results=[_result('少数派', articles=[{'title': 'T', 'url': 'https://mp.weixin.qq.com/s/x'}])],
+                              summary={'part_label': ''})
+
+    def _call(self, msgtype, template):
+        from jobs import webhook
+        real_get = webhook.cfg.get
+        response = type('R', (), {'raise_for_status': lambda s: None, 'json': lambda s: {'errcode': 0}})()
+        with patch.object(webhook.cfg, 'get', side_effect=lambda k, d=None: msgtype if k == 'webhook.wecom_msgtype' else real_get(k, d)), \
+                patch('requests.post', return_value=response) as post:
+            webhook.call_webhook(self._hook(template))
+        return post.call_args.kwargs['json']
+
+    def test_default_markdown(self):
+        body = self._call('markdown', '### {{ task.name }}')
+        self.assertEqual(body, {'msgtype': 'markdown', 'markdown': {'content': '### 每两小时更新'}})
+
+    def test_text_with_a_tag_links(self):
+        tpl = '【{{ task.name }}】\n{% for article in new_articles %}[{{ article.feed_name }}] <a href="{{ article.url }}">{{ article.title }}</a>{% endfor %}'
+        body = self._call('text', tpl)
+        self.assertEqual(body['msgtype'], 'text')
+        self.assertEqual(body['text']['content'], '【每两小时更新】\n[少数派] <a href="https://mp.weixin.qq.com/s/x">T</a>')
+
+    def test_text_limit_is_2048_bytes(self):
+        from jobs.webhook import WebhookPayloadTooLarge
+        with self.assertRaises(WebhookPayloadTooLarge):
+            self._call('text', '中' * 700)  # 2100 字节：markdown 可发，text 超限
+        self.assertEqual(self._call('markdown', '中' * 700)['msgtype'], 'markdown')
+
+
 class WecomPayloadLimitTest(unittest.TestCase):
     def test_web_hook_keeps_payload_too_large_type(self):
         from jobs import webhook

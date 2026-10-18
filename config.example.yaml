@@ -68,6 +68,8 @@ interval: ${SPAN_INTERVAL:- 10}
 webhook:
   #文章内容的发送格式(默认使用html格式，可选text、markdown)
   content_format: ${WEBHOOK.CONTENT_FORMAT:-html}
+  #企业微信群机器人消息类型(markdown仅企业微信可见；text微信中也能查看，支持<a href>链接)
+  wecom_msgtype: ${WEBHOOK.WECOM_MSGTYPE:-markdown}
 
 #API服务端口
 port: ${PORT:-8001}
