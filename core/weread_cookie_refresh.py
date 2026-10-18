@@ -257,6 +257,8 @@ def _send_cookie_expired_notice():
     """通过后台配置的通知渠道提示用户重新扫码，不包含 Cookie 内容。"""
     from jobs.notice import sys_notice
 
+    # 纯文本消息：企微群机器人的 markdown 在微信里无法查看，纯文本可以，
+    # 且网址在微信中点开后，页面里的确认按钮能直接拉起微信读书授权。
     text = "无头浏览器自动刷新未能恢复登录态，且已确认当前 Cookie 失效。\n"
     rescan_url = ""
     try:
@@ -266,14 +268,14 @@ def _send_cookie_expired_notice():
         print(f"[refresh] 生成免登录扫码链接失败，提醒中仅附后台入口: {e}")
     if rescan_url:
         text += (
-            f"[点此重新扫码授权]({rescan_url})（无需登录后台，"
-            f"{RESCAN_TTL_SECONDS // 3600} 小时内有效，扫码成功后失效）\n"
-            "电脑上打开后用手机微信扫码；也可登录 WeRSS 后台，进入「微信读书管理」重新扫码授权。"
+            f"点击链接重新扫码授权（无需登录后台，{RESCAN_TTL_SECONDS // 3600} 小时内有效，扫码成功后失效）：\n"
+            f"{rescan_url}\n"
+            "手机微信中打开后点「在微信中确认登录」；电脑上打开后用手机微信扫码。"
         )
     else:
         text += "请登录 WeRSS 后台，进入「微信读书管理」重新扫码授权。"
 
-    sys_notice(title="微信读书 Cookie 已失效", tag="微信读书授权", text=text)
+    sys_notice(title="微信读书 Cookie 已失效", tag="微信读书授权", text=text, plain=True)
 
 
 def _extract_cookie_from_page(page, context, url: str) -> str:

@@ -28,7 +28,7 @@ def _is_bark_url(webhook_url: str) -> bool:
     return False
 
 
-def notice( webhook_url, title, text,notice_type: str=None):
+def notice( webhook_url, title, text,notice_type: str=None, msgtype: str="markdown"):
     """
     公用通知方法，根据类型判断调用哪种通知
     
@@ -56,7 +56,7 @@ def notice( webhook_url, title, text,notice_type: str=None):
             notice_type = 'custom'
     
     if notice_type == 'wechat':
-        send_wechat_message(webhook_url, title, text)
+        send_wechat_message(webhook_url, title, text, msgtype=msgtype)
     elif notice_type == 'dingtalk':
         send_dingtalk_message(webhook_url, title, text)
     elif notice_type == 'feishu':
