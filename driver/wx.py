@@ -894,9 +894,21 @@ class Wx:
             report("done", "可自动轮转的有效账号少于两个，本轮保持当前账号", 100)
             return True
 
+        def next_candidate(current_id: str) -> str:
+            if current_id in candidates:
+                return candidates[(candidates.index(current_id) + 1) % len(candidates)]
+            return candidates[0]
+
+        async def rotate_by_cache(reason: str):
+            # 容器重启后没有打开的后台页面，或页面已登出读不到切换列表时，
+            # 按缓存的当前账号选下一个，由 switch_account 启动浏览器并恢复缓存会话。
+            target_id = next_candidate(str(status.get("active_account_id") or ""))
+            target_name = status_by_id.get(target_id, {}).get("name") or target_id
+            report("rotating", f"{reason}，按缓存会话切换到 {target_name}（{target_id}）…", 70)
+            return await self.switch_account(target_id, progress_callback=progress_callback)
+
         if not self.controller or not self.controller.is_page_valid() or self.controller.page is None:
-            report("failed", "公众号后台页面不可用，无法自动轮转账号", 100)
-            return False
+            return await rotate_by_cache("公众号后台页面未打开")
 
         try:
             await self._open_account_switch_dialog()
@@ -915,21 +927,21 @@ class Wx:
             live_ids = {entry["account_id"] for entry in entries}
             candidates = [account_id for account_id in candidates if account_id in live_ids]
         except Exception as e:
-            report("failed", f"无法读取公众号切换列表，自动轮转已跳过：{e}", 100)
-            return False
+            read_error = e
+        else:
+            read_error = None
         finally:
             try:
                 await self._close_account_switch_dialog()
             except Exception:
                 pass
+        if read_error is not None:
+            return await rotate_by_cache(f"无法读取公众号切换列表（{read_error}）")
 
         if len(candidates) < 2:
             report("done", "后台可切换且会话有效的账号少于两个，本轮保持当前账号", 100)
             return True
-        if current_id in candidates:
-            target_id = candidates[(candidates.index(current_id) + 1) % len(candidates)]
-        else:
-            target_id = candidates[0]
+        target_id = next_candidate(current_id)
         target = next(entry for entry in entries if entry["account_id"] == target_id)
         report("rotating", f"按账号 ID 顺序自动切换到 {target['name']}（{target_id}）…", 70)
         return await self.switch_account(target_id, progress_callback=progress_callback)
