@@ -14,6 +14,44 @@ from apis.weread import (
 )
 
 
+class WereadRescanAPITest(unittest.TestCase):
+    """免登录扫码接口只凭令牌授权，且绝不返回登录数据。"""
+
+    def _qr(self, status):
+        qr = type("QR", (), {})()
+        qr.QrStatus = lambda: status
+        return qr
+
+    @patch("core.weread_rescan.verify_token", return_value=False)
+    def test_invalid_token_is_rejected_everywhere(self, _verify):
+        from apis.weread import weread_rescan_page, weread_rescan_qr, weread_rescan_status
+        self.assertEqual(weread_rescan_page("bad").status_code, 403)
+        self.assertFalse(weread_rescan_qr("bad")["ok"])
+        self.assertEqual(weread_rescan_status("bad")["state"], "invalid")
+
+    @patch("core.weread_rescan.consume_token")
+    @patch("core.weread_rescan.verify_token", return_value=True)
+    def test_success_consumes_token_without_leaking_cookies(self, _verify, consume):
+        from apis.weread import weread_rescan_status
+        status = {"login_status": True, "msg": "登录成功",
+                  "data": {"cookies": {"wr_skey": "secret"}, "vid": "1"}}
+        with patch("apis.weread.WereadQRLogin", return_value=self._qr(status)):
+            result = weread_rescan_status("tok")
+        self.assertEqual(result, {"state": "success", "msg": "授权成功"})
+        consume.assert_called_once_with("tok")
+        self.assertNotIn("secret", str(result))
+
+    @patch("core.weread_rescan.verify_token", return_value=True)
+    def test_waiting_and_expired_states(self, _verify):
+        from apis.weread import weread_rescan_status
+        with patch("apis.weread.WereadQRLogin",
+                   return_value=self._qr({"login_status": False, "msg": "等待扫码...", "data": {}})):
+            self.assertEqual(weread_rescan_status("tok")["state"], "waiting")
+        with patch("apis.weread.WereadQRLogin",
+                   return_value=self._qr({"login_status": False, "msg": "二维码已过期，请重新获取", "data": {}})):
+            self.assertEqual(weread_rescan_status("tok")["state"], "expired")
+
+
 class WereadConfigAPITest(unittest.TestCase):
     @patch("apis.weread._save_weread_data")
     @patch("apis.weread._load_weread_data", return_value={})

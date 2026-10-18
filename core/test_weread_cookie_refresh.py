@@ -112,16 +112,30 @@ class WereadCookieRefreshTests(unittest.TestCase):
             "unknown",
         )
 
-    def test_expired_cookie_notice_uses_system_notification_without_cookie_value(self):
+    def _notice_text(self, rescan_url):
         notice_module = types.ModuleType("jobs.notice")
         notice_module.sys_notice = Mock()
-        with patch.dict(sys.modules, {"jobs.notice": notice_module}):
+        rescan_module = types.ModuleType("core.weread_rescan")
+        rescan_module.RESCAN_TTL_SECONDS = 24 * 3600
+        rescan_module.issue_token = Mock(return_value="token")
+        rescan_module.build_rescan_url = Mock(return_value=rescan_url)
+        with patch.dict(sys.modules, {"jobs.notice": notice_module, "core.weread_rescan": rescan_module}):
             _send_cookie_expired_notice()
-
         notice_module.sys_notice.assert_called_once()
-        args = notice_module.sys_notice.call_args.kwargs
+        return notice_module.sys_notice.call_args.kwargs
+
+    def test_expired_cookie_notice_uses_system_notification_without_cookie_value(self):
+        args = self._notice_text("")
         self.assertIn("微信读书 Cookie 已失效", args["title"])
         self.assertIn("重新扫码授权", args["text"])
+        self.assertNotIn("wr_skey", args["text"])
+        self.assertNotIn("](", args["text"])
+
+    def test_expired_cookie_notice_includes_rescan_link(self):
+        url = "https://rss.example.com/api/v1/wx/weread/rescan?t=token"
+        args = self._notice_text(url)
+        self.assertIn(f"[点此重新扫码授权]({url})", args["text"])
+        self.assertIn("24 小时内有效", args["text"])
         self.assertNotIn("wr_skey", args["text"])
 
     def test_does_not_overwrite_a_cookie_saved_during_browser_refresh(self):

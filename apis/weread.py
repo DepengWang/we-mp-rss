@@ -8,6 +8,7 @@ import json
 import os
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -617,6 +618,126 @@ async def weread_qr_status(current_user=Depends(get_current_user)):
     wr_qr = WereadQRLogin()
     status = wr_qr.QrStatus()
     return success_response(status)
+
+
+# ---- 免登录重新扫码（失效提醒中的链接） ----
+# 这些接口不要求登录，由 core.weread_rescan 的签名令牌授权；
+# 只返回状态文字和二维码，绝不透传 QrStatus 中的 Cookie 等登录数据。
+
+_RESCAN_PAGE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>微信读书重新授权</title>
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f6f7;color:#1f2329}
+main{max-width:420px;margin:0 auto;padding:32px 16px;text-align:center}
+.card{background:#fff;border-radius:12px;padding:24px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+h1{font-size:20px;margin:0 0 8px}p{color:#646a73;font-size:14px;line-height:1.6;margin:8px 0}
+img{width:240px;height:240px;margin:12px auto;display:block;image-rendering:pixelated}
+a.btn,button{display:inline-block;margin-top:12px;padding:10px 20px;border-radius:8px;border:0;font-size:15px;text-decoration:none;cursor:pointer}
+a.btn{background:#07c160;color:#fff}button{background:#e8eaed;color:#1f2329}
+#state{font-weight:600;color:#1f2329}.ok{color:#07c160!important}.err{color:#d83931!important}
+</style></head><body><main><div class="card">
+<h1>微信读书重新授权</h1>
+<p id="state">正在生成二维码…</p>
+<div id="qr" hidden>
+<img id="qrimg" alt="微信读书登录二维码">
+<p>电脑上打开：用手机<b>微信</b>扫描上方二维码</p>
+<p>手机上打开：点下方按钮在微信中确认（企业微信内若无法确认，请复制链接到微信打开）</p>
+<a class="btn" id="confirm" href="#">在微信中确认登录</a>
+</div>
+<button id="retry" hidden>重新生成二维码</button>
+</div></main>
+<script>
+const t = new URLSearchParams(location.search).get("t") || "";
+const base = location.pathname;
+const $ = (id) => document.getElementById(id);
+let timer = null;
+function setState(text, cls) { const s = $("state"); s.textContent = text; s.className = cls || ""; }
+async function start() {
+  $("retry").hidden = true; $("qr").hidden = true; setState("正在生成二维码…");
+  try {
+    const r = await fetch(base + "/qr?t=" + encodeURIComponent(t), {method: "POST"});
+    const j = await r.json();
+    if (!j.ok) { setState(j.msg, "err"); if (j.retry) $("retry").hidden = false; return; }
+    $("qrimg").src = j.qr; $("confirm").href = j.confirm_url; $("qr").hidden = false;
+    setState("等待扫码…（二维码 5 分钟内有效）");
+    clearInterval(timer); timer = setInterval(poll, 2000);
+  } catch (e) { setState("网络错误，请重试", "err"); $("retry").hidden = false; }
+}
+async function poll() {
+  try {
+    const r = await fetch(base + "/status?t=" + encodeURIComponent(t));
+    const j = await r.json();
+    if (j.state === "success") { clearInterval(timer); $("qr").hidden = true; setState("授权成功，可以关闭此页面", "ok"); }
+    else if (j.state === "expired" || j.state === "error" || j.state === "invalid") {
+      clearInterval(timer); setState(j.msg, "err"); if (j.state !== "invalid") $("retry").hidden = false;
+    } else { setState(j.msg); }
+  } catch (e) { /* 临时网络错误，下次继续轮询 */ }
+}
+$("retry").onclick = start;
+start();
+</script></body></html>"""
+
+
+def _rescan_invalid_page() -> HTMLResponse:
+    return HTMLResponse(
+        "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>链接已失效</title><body style='font-family:sans-serif;text-align:center;padding:48px 16px'>"
+        "<h2>链接已失效</h2><p>该链接已过期、已被使用或已被新的提醒替换。<br>"
+        "请使用最新一条提醒中的链接，或登录 WeRSS 后台扫码授权。</p></body>",
+        status_code=403,
+    )
+
+
+@router.get("/rescan", summary="免登录重新扫码页面", include_in_schema=False)
+def weread_rescan_page(t: str = ""):
+    from core.weread_rescan import verify_token
+    if not verify_token(t):
+        return _rescan_invalid_page()
+    return HTMLResponse(_RESCAN_PAGE, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/rescan/qr", summary="免登录重新扫码：生成二维码", include_in_schema=False)
+def weread_rescan_qr(t: str = ""):
+    """生成新的二维码并开始轮询。getLoginUid 为同步网络请求，必须用普通 def。"""
+    import base64
+    from core.weread_rescan import verify_token
+    if not verify_token(t):
+        return {"ok": False, "msg": "链接已失效，请使用最新提醒中的链接", "retry": False}
+
+    wr_qr = WereadQRLogin()
+    code_path = wr_qr.GetCode(CallBack=lambda result: print("Weread QR（免登录链接）登录成功，Cookie 已自动保存"))
+    if not code_path or not wr_qr._uid:
+        return {"ok": False, "msg": "获取二维码失败，请稍后重试", "retry": True}
+    try:
+        with open(code_path.lstrip("/"), "rb") as f:
+            qr_data = "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+    except OSError:
+        return {"ok": False, "msg": "二维码图片生成失败，请稍后重试", "retry": True}
+    return {
+        "ok": True,
+        "qr": qr_data,
+        "confirm_url": f"https://weread.qq.com/web/confirm?uid={wr_qr._uid}",
+    }
+
+
+@router.get("/rescan/status", summary="免登录重新扫码：查询状态", include_in_schema=False)
+def weread_rescan_status(t: str = ""):
+    from core.weread_rescan import consume_token, verify_token
+    if not verify_token(t):
+        return {"state": "invalid", "msg": "链接已失效，请使用最新提醒中的链接"}
+    status = WereadQRLogin().QrStatus()
+    if status.get("login_status"):
+        consume_token(t)
+        return {"state": "success", "msg": "授权成功"}
+    msg = str(status.get("msg") or "")
+    if (status.get("data") or {}).get("logicCode") == "COOKIE_INVALID":
+        return {"state": "error", "msg": msg or "登录成功但 Cookie 验证失败，请重新扫码"}
+    if "过期" in msg:
+        return {"state": "expired", "msg": msg}
+    return {"state": "waiting", "msg": msg or "等待扫码…"}
 
 
 @router.get("/qr/over", summary="微信读书扫码完成")
