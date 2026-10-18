@@ -134,9 +134,10 @@ class WereadCookieRefreshTests(unittest.TestCase):
     def test_expired_cookie_notice_includes_rescan_link(self):
         url = "https://rss.example.com/api/v1/wx/weread/rescan?t=token"
         args = self._notice_text(url)
-        # 纯文本 + <a> 标签：微信里 markdown 无法查看，文本中的 a 标签可点击
+        # 纯文本 + 裸网址：电脑端微信/企微不解析 <a> 标签，裸网址四端都可点击
         self.assertTrue(args["plain"])
-        self.assertIn(f'<a href="{url}">点此重新扫码授权</a>', args["text"])
+        self.assertIn(f"\n{url}\n", args["text"])
+        self.assertNotIn("<a ", args["text"])
         self.assertNotIn("](", args["text"])
         self.assertIn("24 小时内有效", args["text"])
         self.assertNotIn("wr_skey", args["text"])

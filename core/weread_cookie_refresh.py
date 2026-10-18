@@ -257,10 +257,10 @@ def _send_cookie_expired_notice():
     """通过后台配置的通知渠道提示用户重新扫码，不包含 Cookie 内容。"""
     from jobs.notice import sys_notice
 
-    # 纯文本消息：企微群机器人的 markdown 在微信里无法查看，纯文本可以；
-    # 文本中的 <a href> 在微信和企微里都能显示为可点击链接（已实测）。
-    # 在微信中点开后，页面里的确认按钮能直接拉起微信读书授权。
-    from html import escape
+    # 纯文本消息 + 裸网址：企微群机器人的 markdown 在微信里无法查看；文本里的
+    # <a href> 只有手机端会解析，电脑端微信/企微原样显示；图文消息在微信里不支持。
+    # 裸网址在四个客户端都能自动识别为链接（已实测）。在微信中点开后，
+    # 页面里的确认按钮能直接拉起微信读书授权。
     text = "无头浏览器自动刷新未能恢复登录态，且已确认当前 Cookie 失效。\n"
     rescan_url = ""
     try:
@@ -270,8 +270,8 @@ def _send_cookie_expired_notice():
         print(f"[refresh] 生成免登录扫码链接失败，提醒中仅附后台入口: {e}")
     if rescan_url:
         text += (
-            f'<a href="{escape(rescan_url, quote=True)}">点此重新扫码授权</a>'
-            f"（无需登录后台，{RESCAN_TTL_SECONDS // 3600} 小时内有效，扫码成功后失效）\n"
+            f"点击链接重新扫码授权（无需登录后台，{RESCAN_TTL_SECONDS // 3600} 小时内有效，扫码成功后失效）：\n"
+            f"{rescan_url}\n"
             "手机微信中打开后点「在微信中确认登录」；电脑上打开后用手机微信扫码。"
         )
     else:
