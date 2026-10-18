@@ -8,6 +8,13 @@ from core.lax import TemplateParser
 from datetime import datetime
 from core.log import logger
 from core.config import cfg
+
+# 企微群机器人 markdown.content 上限 4096 字节（UTF-8），超出返回 errcode=40058。
+WECOM_MARKDOWN_MAX_BYTES = 4096
+
+
+class WebhookPayloadTooLarge(ValueError):
+    """渲染后的消息超过接收方长度上限；调用方可拆分 results 后重发。"""
 from bs4 import BeautifulSoup
 from core.content_format import format_content
 import re
@@ -408,6 +415,11 @@ def call_webhook(hook: MessageWebHook, is_test: bool = False) -> str:
     )
 
     if is_wecom_bot:
+        payload_bytes = len(str(payload).encode("utf-8"))
+        if payload_bytes > WECOM_MARKDOWN_MAX_BYTES:
+            raise WebhookPayloadTooLarge(
+                f"企微消息 {payload_bytes} 字节，超过 {WECOM_MARKDOWN_MAX_BYTES} 字节上限"
+            )
         headers["Content-Type"] = "application/json"
         try:
             response = requests.post(
@@ -529,5 +541,8 @@ def web_hook(hook:MessageWebHook, is_test:bool = False):
             return call_webhook(hook, is_test)
         else:
             raise ValueError(f"未知的消息类型: {hook.task.message_type}")
+    except WebhookPayloadTooLarge:
+        # 保留异常类型，让汇总发送方拆分后重试
+        raise
     except Exception as e:
         raise ValueError(f"处理消息时出错: {str(e)}")

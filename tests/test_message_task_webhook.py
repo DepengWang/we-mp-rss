@@ -81,6 +81,42 @@ class BatchedWebhookTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(len(calls), 3)
 
+    def test_oversized_summary_is_split_until_it_fits(self):
+        from jobs.webhook import WebhookPayloadTooLarge
+        delivered = []
+
+        def limited(hook):
+            # 模拟企微 4096 字节上限：超过 10 个订阅源的汇总被拒绝
+            if len(hook.results) > 10:
+                raise WebhookPayloadTooLarge('too large')
+            delivered.append([r['mp_name'] for r in hook.results])
+
+        results = [_result(f'mp{i}') for i in range(35)]
+        with patch.object(mps, 'web_hook', side_effect=limited):
+            ok = self._send(results)
+        self.assertTrue(ok)
+        # 35 → 17/18 → 8/9/9/9，每个订阅源恰好出现一次且顺序不变
+        self.assertEqual([name for chunk in delivered for name in chunk], [f'mp{i}' for i in range(35)])
+        self.assertTrue(all(len(chunk) <= 10 for chunk in delivered))
+        # 每两条实际发出的消息之间都要留间隔
+        self.assertGreaterEqual(self.sleep.call_count, len(delivered) - 1)
+
+    def test_single_oversized_result_is_reported_as_failure(self):
+        from jobs.webhook import WebhookPayloadTooLarge
+        with patch.object(mps, 'web_hook', side_effect=WebhookPayloadTooLarge('too large')):
+            self.assertFalse(self._send([_result('a')]))
+
+
+class WecomPayloadLimitTest(unittest.TestCase):
+    def test_web_hook_keeps_payload_too_large_type(self):
+        from jobs import webhook
+        from jobs.webhook import MessageWebHook, WebhookPayloadTooLarge
+
+        task = type('Task', (), {'message_type': 1})()
+        with patch.object(webhook, 'call_webhook', side_effect=WebhookPayloadTooLarge('x')):
+            with self.assertRaises(WebhookPayloadTooLarge):
+                webhook.web_hook(MessageWebHook(task=task, results=[_result('a')]))
+
 
 if __name__ == '__main__':
     unittest.main()

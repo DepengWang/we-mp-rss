@@ -519,10 +519,9 @@ class MessageTaskTracker:
 
         汇总包含最后不足一批的文章，以及所有没有文章的订阅源（失败、频率限制、
         成功但无新文章），保证用户每轮都能收到完整的执行状态。
-        单批失败不会中断后续批次；全部发送成功时返回 True。
+        单批失败不会中断后续批次；超过消息长度上限时自动拆分；
+        全部发送成功时返回 True。
         """
-        from jobs.webhook import MessageWebHook
-
         # 只把成功订阅源的文章拆进批次；失败项保留原样进入汇总。
         article_batches = []
         pending_articles = []
@@ -555,20 +554,40 @@ class MessageTaskTracker:
             final_summary['new_articles'] = len(pending_articles)
             messages.append(("汇总", summary_results, final_summary))
 
+        state = {'sent': 0}
         failed = 0
-        for index, (label, results, batch_summary) in enumerate(messages):
-            if index > 0:
-                # 企微群机器人限制每分钟 20 条，批次间留出间隔避免 errcode 45009。
-                time.sleep(self.WEBHOOK_SEND_INTERVAL)
-            try:
-                web_hook(MessageWebHook(task=task, results=results, summary=batch_summary))
-                print_success(f"消息任务 [{task_id}] {label} 发送完成")
-            except Exception as e:
-                failed += 1
-                print_error(f"消息任务 [{task_id}] {label} 发送失败: {e}")
+        for label, results, batch_summary in messages:
+            failed += self._send_splitting(task_id, task, label, results, batch_summary, state)
         if failed:
-            print_warning(f"消息任务 [{task_id}] Webhook 共 {len(messages)} 条，失败 {failed} 条")
+            print_warning(f"消息任务 [{task_id}] Webhook 共 {state['sent']} 条，失败 {failed} 条")
         return failed == 0
+
+    def _send_splitting(self, task_id: str, task, label: str, results: list, summary: dict, state: dict) -> int:
+        """发送一条消息；超过长度上限时按订阅源对半拆分后重发。返回失败条数。"""
+        from jobs.webhook import MessageWebHook, WebhookPayloadTooLarge
+
+        if state['sent'] > 0:
+            # 企微群机器人限制每分钟 20 条，批次间留出间隔避免 errcode 45009。
+            time.sleep(self.WEBHOOK_SEND_INTERVAL)
+        state['sent'] += 1
+        try:
+            web_hook(MessageWebHook(task=task, results=results, summary=summary))
+            print_success(f"消息任务 [{task_id}] {label} 发送完成")
+            return 0
+        except WebhookPayloadTooLarge as e:
+            state['sent'] -= 1  # 长度预检未真正发出请求
+            if len(results) <= 1:
+                print_error(f"消息任务 [{task_id}] {label} 发送失败: {e}，单个订阅源无法再拆分")
+                return 1
+            print_warning(f"消息任务 [{task_id}] {label} 超过长度上限，拆成两条重发")
+            mid = len(results) // 2
+            return (
+                self._send_splitting(task_id, task, f"{label}-1", results[:mid], summary, state)
+                + self._send_splitting(task_id, task, f"{label}-2", results[mid:], summary, state)
+            )
+        except Exception as e:
+            print_error(f"消息任务 [{task_id}] {label} 发送失败: {e}")
+            return 1
 
     def get_task_status(self, task_id: str) -> dict:
         """获取任务状态"""
