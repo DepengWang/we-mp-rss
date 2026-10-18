@@ -150,6 +150,7 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                             print_info(f"[{mp.mp_name}] 微信读书公众号 → weread_mp 采集模式")
                         else:
                             blocked_reason = "微信读书 Cookie 未配置，跳过采集"
+                web_skipped = False
                 try:
                     from core.wx.collection_guard import CollectionGuard
                     guard = CollectionGuard(mp.id)
@@ -157,6 +158,17 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                         try:
                             if blocked_reason:
                                 raise RuntimeError(blocked_reason)
+                            web_limited_reason = (
+                                tracker.get_web_limited(task.id)
+                                if task and collection_method == "web" else ""
+                            )
+                            if web_limited_reason:
+                                # 熔断：本批次已有订阅源触发 Web 频率限制，继续请求只会
+                                # 延长限制；后续订阅源直接走微信读书兜底。
+                                web_skipped = True
+                                raise RuntimeError(
+                                    f"本批次 Web 采集已触发频率限制，跳过 Web 请求（{web_limited_reason}）"
+                                )
                             wx.get_Articles(mp.faker_id,CallBack=UpdateArticle,Mps_id=mp.id,Mps_title=mp.mp_name, MaxPage=1,Over_CallBack=Update_Over,interval=interval)
                             if getattr(wx, "collection_failed", False):
                                 raise RuntimeError(
@@ -171,7 +183,17 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                                     task.id,
                                     "微信读书 Token 在本批采集中失效，后续订阅源将跳过微信读书采集",
                                 )
-                            source_was_rate_limited = getattr(wx, "collection_limited", False)
+                            source_was_rate_limited = web_skipped or getattr(wx, "collection_limited", False)
+                            if (
+                                source_was_rate_limited and not web_skipped
+                                and task and collection_method == "web"
+                                and tracker.mark_web_limited(
+                                    task.id, getattr(wx, "collection_error", "") or str(collection_error)
+                                )
+                            ):
+                                print_warning(
+                                    f"[{mp.mp_name}] Web 采集触发频率限制，本批次后续订阅源不再请求 Web"
+                                )
                             if source_was_rate_limited:
                                 if collection_method.startswith("weread_"):
                                     limited = True
@@ -351,8 +373,23 @@ class MessageTaskTracker:
                 'webhook_sent': False,
                 'finalizing': False,
                 'finished': False,
+                'web_limited': '',
             }
             return True
+
+    def mark_web_limited(self, task_id: str, message: str) -> bool:
+        """记录本批次 Web 采集已触发频率限制；首次记录时返回 True。"""
+        with self._task_lock:
+            task_info = self._tasks.get(task_id)
+            if not task_info or task_info.get('web_limited'):
+                return False
+            task_info['web_limited'] = message or 'Web 采集触发频率限制'
+            return True
+
+    def get_web_limited(self, task_id: str) -> str:
+        """本批次 Web 已限频时返回原因，否则返回空字符串。"""
+        with self._task_lock:
+            return (self._tasks.get(task_id) or {}).get('web_limited', '')
 
     def set_weread_state(self, task_id: str, status: str, message: str) -> None:
         with self._task_lock:

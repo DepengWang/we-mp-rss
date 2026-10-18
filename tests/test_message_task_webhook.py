@@ -107,6 +107,78 @@ class BatchedWebhookTest(unittest.TestCase):
             self.assertFalse(self._send([_result('a')]))
 
 
+class _FakeCollector:
+    def __init__(self, limited=False):
+        self.limited = limited
+        self.calls = []
+        self.articles = []
+        self.collection_failed = False
+        self.collection_limited = False
+        self.collection_error = ""
+
+    def get_Articles(self, faker_id, **kwargs):
+        self.calls.append(kwargs.get("Mps_id"))
+        if self.limited:
+            self.collection_failed = True
+            self.collection_limited = True
+            self.collection_error = "Web 采集触发频率限制"
+
+    def all_count(self):
+        return 0
+
+
+class WebRateLimitBreakerTest(unittest.TestCase):
+    def setUp(self):
+        self.tracker = mps.tracker
+        self.task = type('Task', (), {'id': 'breaker-task', 'name': 'breaker'})()
+        self.tracker._tasks.pop(self.task.id, None)
+        self.tracker.start_task(self.task.id, 3, None)
+        self.tracker.set_weread_state(self.task.id, 'valid', 'ok')
+        self.web = _FakeCollector(limited=True)
+        self.weread_calls = []
+        test = self
+
+        class FakeWereadMP(_FakeCollector):
+            def get_Articles(self, faker_id, **kwargs):
+                test.weread_calls.append(kwargs.get("Mps_id"))
+
+        self.patches = [
+            patch.object(mps, 'WxGather', return_value=type('G', (), {'Model': lambda _self: self.web})()),
+            patch('core.wx.model.weread_mp.MpsWereadMP', FakeWereadMP),
+            patch.dict(cfg.config, {'gather': {'model': 'web'}}),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tracker._tasks.pop(self.task.id, None)
+
+    def _feed(self, i):
+        return type('Feed', (), {'id': f'MP_WXS_10{i}', 'mp_name': f'mp{i}', 'faker_id': f'fake{i}'})()
+
+    def test_first_rate_limit_stops_web_requests_for_rest_of_batch(self):
+        for i in range(3):
+            mps.do_job(self._feed(i), self.task)
+        # 只有第一个订阅源真正请求了 Web，三个都走了微信读书兜底
+        self.assertEqual(self.web.calls, ['MP_WXS_100'])
+        self.assertEqual(self.weread_calls, ['MP_WXS_100', 'MP_WXS_101', 'MP_WXS_102'])
+        results = self.tracker._tasks[self.task.id]['mp_results']
+        self.assertTrue(all(r['success'] for r in results))
+        self.assertTrue(all(r['web_status'] == 'limited' for r in results))
+        self.assertTrue(self.tracker.get_web_limited(self.task.id))
+
+    def test_new_batch_tries_web_again(self):
+        mps.do_job(self._feed(0), self.task)
+        self.tracker._tasks.pop(self.task.id, None)
+        self.tracker.start_task(self.task.id, 1, None)
+        self.tracker.set_weread_state(self.task.id, 'valid', 'ok')
+        self.assertEqual(self.tracker.get_web_limited(self.task.id), '')
+        mps.do_job(self._feed(1), self.task)
+        self.assertEqual(self.web.calls, ['MP_WXS_100', 'MP_WXS_101'])
+
+
 class BatchWereadAuthTest(unittest.TestCase):
     def test_valid_token_skips_refresh(self):
         with patch.object(mps, '_check_weread_auth', return_value=('valid', 'ok')), \
