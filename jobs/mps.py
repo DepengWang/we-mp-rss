@@ -607,20 +607,31 @@ class MessageTaskTracker:
             # 企微群机器人限制每分钟 20 条，批次间留出间隔避免 errcode 45009。
             time.sleep(self.WEBHOOK_SEND_INTERVAL)
         state['sent'] += 1
+        send_summary = dict(summary)
+        send_summary.pop('_split', None)
+        if summary.get('_split'):
+            # 拆分后每条都会渲染同样的标题和统计，标出序号避免看起来像重复发送。
+            state['part'] = state.get('part', 0) + 1
+            send_summary['part_label'] = f"（第 {state['part']} 部分）"
+        else:
+            send_summary.setdefault('part_label', '')
         try:
-            web_hook(MessageWebHook(task=task, results=results, summary=summary))
+            web_hook(MessageWebHook(task=task, results=results, summary=send_summary))
             print_success(f"消息任务 [{task_id}] {label} 发送完成")
             return 0
         except WebhookPayloadTooLarge as e:
             state['sent'] -= 1  # 长度预检未真正发出请求
+            if summary.get('_split'):
+                state['part'] -= 1  # 未发出的分段不占序号
             if len(results) <= 1:
                 print_error(f"消息任务 [{task_id}] {label} 发送失败: {e}，单个订阅源无法再拆分")
                 return 1
             print_warning(f"消息任务 [{task_id}] {label} 超过长度上限，拆成两条重发")
             mid = len(results) // 2
+            split_summary = dict(summary, _split=True)
             return (
-                self._send_splitting(task_id, task, f"{label}-1", results[:mid], summary, state)
-                + self._send_splitting(task_id, task, f"{label}-2", results[mid:], summary, state)
+                self._send_splitting(task_id, task, f"{label}-1", results[:mid], split_summary, state)
+                + self._send_splitting(task_id, task, f"{label}-2", results[mid:], split_summary, state)
             )
         except Exception as e:
             print_error(f"消息任务 [{task_id}] {label} 发送失败: {e}")

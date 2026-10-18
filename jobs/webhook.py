@@ -100,6 +100,18 @@ def _flatten_results(results: list[dict]) -> tuple[list[dict], list[dict], list[
             weread_fallbacks.append({"feed_name": feed_name, "status_color": "info"})
     return new_articles, failures, limited_sources, weread_limited_sources, no_new_articles, weread_fallbacks
 
+
+def _add_compact_lists(data: dict) -> None:
+    """为逐个订阅源的状态列表补充单行文本和数量。
+
+    模板循环每项都会换行，35 个订阅源各占一行会让汇总超过企微 4096 字节上限
+    而被拆成多条；模板可改用 ``{{ no_new_articles_text }}`` 等变量一行展示。
+    """
+    for key in ("no_new_articles", "weread_fallbacks"):
+        names = [str(item.get("feed_name") or "") for item in data.get(key) or []]
+        data[f"{key}_text"] = "、".join(name for name in names if name)
+        data[f"{key}_count"] = len(names)
+
 def send_message(hook: MessageWebHook) -> str:
     """
     发送格式化消息
@@ -167,6 +179,7 @@ def send_message(hook: MessageWebHook) -> str:
     }
     if hook.results:
         data["new_articles"], data["failures"], data["limited_sources"], data["weread_limited_sources"], data["no_new_articles"], data["weread_fallbacks"] = _flatten_results(processed_results)
+        _add_compact_lists(data)
     message = parser.render(data)
     # 这里可以添加发送消息的具体实现
     print("发送消息:", message)
@@ -351,6 +364,7 @@ def call_webhook(hook: MessageWebHook, is_test: bool = False) -> str:
     }
     if hook.results:
         data["new_articles"], data["failures"], data["limited_sources"], data["weread_limited_sources"], data["no_new_articles"], data["weread_fallbacks"] = _flatten_results(processed_results)
+        _add_compact_lists(data)
 
    # 预处理content字段
     import json

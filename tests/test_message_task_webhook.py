@@ -101,6 +101,26 @@ class BatchedWebhookTest(unittest.TestCase):
         # 每两条实际发出的消息之间都要留间隔
         self.assertGreaterEqual(self.sleep.call_count, len(delivered) - 1)
 
+    def test_split_parts_are_numbered_without_gaps(self):
+        from jobs.webhook import WebhookPayloadTooLarge
+        labels = []
+
+        def limited(hook):
+            if len(hook.results) > 10:
+                raise WebhookPayloadTooLarge('too large')
+            labels.append(hook.summary['part_label'])
+
+        with patch.object(mps, 'web_hook', side_effect=limited):
+            self._send([_result(f'mp{i}') for i in range(35)])
+        # 35 → 17/18 → 8/9/9/9：二次拆分时未发出的分段不占序号
+        self.assertEqual(labels, [f'（第 {i} 部分）' for i in range(1, len(labels) + 1)])
+        self.assertNotIn('_split', str(labels))
+
+    def test_unsplit_summary_has_empty_part_label(self):
+        self._send([_result('a')])
+        self.assertEqual(self.sent[0].summary['part_label'], '')
+        self.assertNotIn('_split', self.sent[0].summary)
+
     def test_single_oversized_result_is_reported_as_failure(self):
         from jobs.webhook import WebhookPayloadTooLarge
         with patch.object(mps, 'web_hook', side_effect=WebhookPayloadTooLarge('too large')):
@@ -206,6 +226,41 @@ class BatchWereadAuthTest(unittest.TestCase):
                 patch('core.weread_cookie_refresh.refresh_in_container') as refresh:
             self.assertEqual(mps._resolve_batch_weread_auth(), ('invalid', 'expired'))
             refresh.assert_not_called()
+
+
+class CompactListTest(unittest.TestCase):
+    def test_status_lists_get_single_line_text_and_count(self):
+        from jobs.webhook import _add_compact_lists
+        data = {
+            'no_new_articles': [{'feed_name': '少数派'}, {'feed_name': '虎嗅APP'}],
+            'weread_fallbacks': [{'feed_name': '果壳'}],
+        }
+        _add_compact_lists(data)
+        self.assertEqual(data['no_new_articles_text'], '少数派、虎嗅APP')
+        self.assertEqual(data['no_new_articles_count'], 2)
+        self.assertEqual(data['weread_fallbacks_text'], '果壳')
+        self.assertEqual(data['weread_fallbacks_count'], 1)
+
+    def test_empty_lists_render_nothing(self):
+        from jobs.webhook import _add_compact_lists
+        data = {}
+        _add_compact_lists(data)
+        self.assertEqual(data['no_new_articles_text'], '')
+        self.assertEqual(data['weread_fallbacks_count'], 0)
+
+    def test_template_renders_compact_lines(self):
+        from core.lax import TemplateParser
+        from jobs.webhook import _add_compact_lists
+        data = {'no_new_articles': [{'feed_name': 'A'}, {'feed_name': 'B'}], 'weread_fallbacks': [],
+                'summary': {'part_label': '（第 2 部分）'}, 'task': {'name': '每两小时更新'}}
+        _add_compact_lists(data)
+        tpl = ("### {{ task.name }}{{ summary.part_label }}\n"
+               "{% if no_new_articles_text %}- 无新文章（{{ no_new_articles_count }}）：{{ no_new_articles_text }}{% endif %}\n"
+               "{% if weread_fallbacks_text %}- 兜底：{{ weread_fallbacks_text }}{% endif %}")
+        out = TemplateParser(tpl).render(data)
+        self.assertIn('### 每两小时更新（第 2 部分）', out)
+        self.assertIn('- 无新文章（2）：A、B', out)
+        self.assertNotIn('兜底', out)
 
 
 class WecomPayloadLimitTest(unittest.TestCase):
