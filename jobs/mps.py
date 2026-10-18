@@ -597,6 +597,43 @@ class MessageTaskTracker:
 tracker = MessageTaskTracker()
 
 
+def _in_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _check_weread_auth():
+    """检查微信读书 Token，返回 (status, message)，status 为 valid/invalid/unknown。"""
+    try:
+        from core.wx.model.weread_mp import MpsWereadMP
+        return MpsWereadMP().validate_auth()
+    except Exception as exc:
+        return 'unknown', f'微信读书状态检查异常：{exc}'
+
+
+def _resolve_batch_weread_auth():
+    """批次开始前确定微信读书 Token 状态；失效时先刷新一次再复查。
+
+    失效常是会话短暂过期，下一轮保活即可恢复；先在容器内刷新一次再判定，
+    避免整轮采集因此失去兜底。接口手动触发时运行在事件循环里，
+    浏览器刷新会阻塞 Web 服务，交给保活线程处理。
+    """
+    status, message = _check_weread_auth()
+    if status != 'invalid' or _in_event_loop():
+        return status, message
+    try:
+        from core.weread_cookie_refresh import refresh_in_container
+        print_warning(f"[weread] 本批次 Token 失效，尝试刷新后复查：{message}")
+        if refresh_in_container():
+            status, message = _check_weread_auth()
+    except Exception as exc:
+        print_warning(f"[weread] 批次前刷新 Cookie 异常：{exc}")
+    return status, message
+
+
 def add_job(feeds:list[Feed]=None,task:MessageTask=None,isTest=False):
     # 微信读书 Cookie 刷新已移至宿主机完成（见 scripts/refresh_weread_cookie.py + launchd 模板），
     # 容器不在内部启动浏览器刷新——因为 profile 由 macOS 钥匙串加密，容器内 Linux Chromium
@@ -631,11 +668,7 @@ def add_job(feeds:list[Feed]=None,task:MessageTask=None,isTest=False):
     if task and not isTest and feeds:
         if not tracker.start_task(task.id, len(feeds), task):
             return
-        try:
-            from core.wx.model.weread_mp import MpsWereadMP
-            weread_status, weread_message = MpsWereadMP().validate_auth()
-        except Exception as exc:
-            weread_status, weread_message = 'unknown', f'微信读书状态检查异常：{exc}'
+        weread_status, weread_message = _resolve_batch_weread_auth()
         if weread_refresh_warning and weread_status != 'valid':
             weread_message = f"{weread_refresh_warning}；{weread_message}"
         tracker.set_weread_state(task.id, weread_status, weread_message)

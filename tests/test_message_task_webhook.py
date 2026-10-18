@@ -107,6 +107,35 @@ class BatchedWebhookTest(unittest.TestCase):
             self.assertFalse(self._send([_result('a')]))
 
 
+class BatchWereadAuthTest(unittest.TestCase):
+    def test_valid_token_skips_refresh(self):
+        with patch.object(mps, '_check_weread_auth', return_value=('valid', 'ok')), \
+                patch('core.weread_cookie_refresh.refresh_in_container') as refresh:
+            self.assertEqual(mps._resolve_batch_weread_auth(), ('valid', 'ok'))
+            refresh.assert_not_called()
+
+    def test_invalid_token_is_rechecked_after_refresh(self):
+        checks = iter([('invalid', 'expired'), ('valid', 'ok')])
+        with patch.object(mps, '_check_weread_auth', side_effect=lambda: next(checks)), \
+                patch.object(mps, '_in_event_loop', return_value=False), \
+                patch('core.weread_cookie_refresh.refresh_in_container', return_value=True):
+            self.assertEqual(mps._resolve_batch_weread_auth(), ('valid', 'ok'))
+
+    def test_failed_refresh_keeps_invalid(self):
+        with patch.object(mps, '_check_weread_auth', return_value=('invalid', 'expired')) as check, \
+                patch.object(mps, '_in_event_loop', return_value=False), \
+                patch('core.weread_cookie_refresh.refresh_in_container', return_value=False):
+            self.assertEqual(mps._resolve_batch_weread_auth(), ('invalid', 'expired'))
+            self.assertEqual(check.call_count, 1)
+
+    def test_manual_api_trigger_does_not_launch_browser(self):
+        with patch.object(mps, '_check_weread_auth', return_value=('invalid', 'expired')), \
+                patch.object(mps, '_in_event_loop', return_value=True), \
+                patch('core.weread_cookie_refresh.refresh_in_container') as refresh:
+            self.assertEqual(mps._resolve_batch_weread_auth(), ('invalid', 'expired'))
+            refresh.assert_not_called()
+
+
 class WecomPayloadLimitTest(unittest.TestCase):
     def test_web_hook_keeps_payload_too_large_type(self):
         from jobs import webhook

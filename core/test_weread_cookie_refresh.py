@@ -12,6 +12,9 @@ except ModuleNotFoundError:
     sys.modules["yaml"] = yaml
 
 from core.weread_cookie_refresh import (
+    _ExpiredNoticeTracker,
+    _browser_refresh_lock,
+    refresh_in_container,
     _cookie_status,
     _extract_cookie_from_page,
     _save_cookie,
@@ -135,6 +138,64 @@ class WereadCookieRefreshTests(unittest.TestCase):
                 )
                 self.assertFalse(changed)
                 save_cookie.assert_not_called()
+
+
+class ExpiredNoticeTrackerTests(unittest.TestCase):
+    def test_single_invalid_check_does_not_notify(self):
+        tracker = _ExpiredNoticeTracker(threshold=2)
+        self.assertFalse(tracker.record("invalid"))
+        # 线上观察到的循环：失效一次后下一轮保活自行恢复
+        self.assertFalse(tracker.record("valid"))
+        self.assertFalse(tracker.record("invalid"))
+
+    def test_consecutive_invalid_notifies_once_per_outage(self):
+        tracker = _ExpiredNoticeTracker(threshold=2)
+        self.assertFalse(tracker.record("invalid"))
+        self.assertTrue(tracker.record("invalid"))
+        tracker.mark_sent()
+        self.assertFalse(tracker.record("invalid"))
+        # 恢复后再次连续失效，可以重新提醒
+        tracker.record("valid")
+        self.assertFalse(tracker.record("invalid"))
+        self.assertTrue(tracker.record("invalid"))
+
+    def test_unknown_neither_counts_nor_resets(self):
+        tracker = _ExpiredNoticeTracker(threshold=2)
+        tracker.record("invalid")
+        self.assertFalse(tracker.record("unknown"))
+        self.assertTrue(tracker.record("invalid"))
+
+    def test_failed_send_allows_retry_next_cycle(self):
+        tracker = _ExpiredNoticeTracker(threshold=2)
+        tracker.record("invalid")
+        self.assertTrue(tracker.record("invalid"))
+        # 未 mark_sent（发送失败），下一轮仍应提醒
+        self.assertTrue(tracker.record("invalid"))
+
+
+class RefreshInContainerTests(unittest.TestCase):
+    def test_skips_without_refresh_url(self):
+        with patch("core.weread_cookie_refresh._load_weread_data", return_value=({}, {})), \
+                patch("core.weread_cookie_refresh.refresh_weread_cookie") as refresh:
+            self.assertFalse(refresh_in_container(timeout_s=1))
+            refresh.assert_not_called()
+
+    def test_runs_headless_refresh_and_returns_result(self):
+        data = {"cookie_refresh_url": "https://weread.qq.com/web/mp/reader/x"}
+        with patch("core.weread_cookie_refresh._load_weread_data", return_value=({}, data)), \
+                patch("core.weread_cookie_refresh.refresh_weread_cookie", return_value=True) as refresh:
+            self.assertTrue(refresh_in_container(timeout_s=5))
+            refresh.assert_called_once_with(
+                verbose=True, headless_only=True, force_bundled=True, cooldown_hours=0,
+            )
+
+    def test_returns_false_when_browser_lock_is_busy(self):
+        data = {"cookie_refresh_url": "https://weread.qq.com/web/mp/reader/x"}
+        with patch("core.weread_cookie_refresh._load_weread_data", return_value=({}, data)), \
+                patch("core.weread_cookie_refresh.refresh_weread_cookie") as refresh:
+            with _browser_refresh_lock:
+                self.assertFalse(refresh_in_container(timeout_s=0.1))
+            refresh.assert_not_called()
 
 
 class MultiAccountCookieSaveTests(unittest.TestCase):

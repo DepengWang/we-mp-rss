@@ -37,6 +37,11 @@ DEFAULT_PROFILE_DIR = os.environ.get(
 )
 _refresh_thread_lock = threading.Lock()
 _refresh_thread_started = False
+# 保活线程与采集批次共用同一个浏览器 profile，两个 Chromium 不能同时打开它。
+_browser_refresh_lock = threading.Lock()
+# 连续确认失效达到该次数才提醒扫码：-2012 也可能是临时配额耗尽，
+# 单次失效常在下一轮保活时自行恢复。
+EXPIRED_NOTICE_THRESHOLD = 2
 
 
 def _read_lic(lic_path: str = DEFAULT_LIC_PATH) -> dict:
@@ -465,6 +470,41 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
     return False
 
 
+def refresh_in_container(timeout_s: float = 180) -> bool:
+    """在容器内无头刷新一次 Cookie，供采集批次在 Token 失效时立即重试。
+
+    在独立线程中运行：调用方可能处于 asyncio 事件循环中，而 Playwright
+    同步 API 不能在事件循环线程里使用。与保活线程共用浏览器锁，
+    锁被占用或刷新超时都返回 False。未配置 cookie_refresh_url 时直接返回 False。
+    """
+    _, data = _load_weread_data()
+    if not (data.get("cookie_refresh_url") or "").strip():
+        return False
+
+    result = {"ok": False}
+
+    def _run():
+        if not _browser_refresh_lock.acquire(timeout=timeout_s):
+            print("[refresh] 浏览器刷新正被占用，本次跳过")
+            return
+        try:
+            result["ok"] = refresh_weread_cookie(
+                verbose=True,
+                headless_only=True,
+                force_bundled=True,
+                cooldown_hours=0,
+            )
+        except Exception as e:
+            print(f"[refresh] 容器内刷新异常: {e}")
+        finally:
+            _browser_refresh_lock.release()
+
+    worker = threading.Thread(target=_run, name="weread-cookie-refresh-once", daemon=True)
+    worker.start()
+    worker.join(timeout_s * 2)
+    return bool(result["ok"])
+
+
 def request_host_refresh(timeout_s: int = 180) -> dict:
     """容器内调用宿主机刷新代理（**不在容器内启动浏览器**）。
 
@@ -517,6 +557,33 @@ def request_host_refresh(timeout_s: int = 180) -> dict:
         }
 
 
+class _ExpiredNoticeTracker:
+    """决定何时提醒扫码：连续确认失效达到阈值才提醒，每段失效期只提醒一次。
+
+    ``unknown`` 不计入也不清零（网络/浏览器故障不能证明 Cookie 状态）；
+    ``valid`` 清零并允许下一段失效期再次提醒。
+    """
+
+    def __init__(self, threshold: int = EXPIRED_NOTICE_THRESHOLD):
+        self.threshold = threshold
+        self.invalid_streak = 0
+        self.notice_sent = False
+
+    def record(self, status: str) -> bool:
+        """记录一次检查结果，返回本次是否应发送提醒。"""
+        if status == "valid":
+            self.invalid_streak = 0
+            self.notice_sent = False
+            return False
+        if status != "invalid":
+            return False
+        self.invalid_streak += 1
+        return self.invalid_streak >= self.threshold and not self.notice_sent
+
+    def mark_sent(self):
+        self.notice_sent = True
+
+
 def start_weread_cookie_refresh_thread(interval_hours: float = 0.5) -> bool:
     """在当前 RSS 进程内启动 Cookie 保活线程。
 
@@ -535,20 +602,21 @@ def start_weread_cookie_refresh_thread(interval_hours: float = 0.5) -> bool:
 
     def _worker():
         interval_seconds = max(float(interval_hours) * 3600, 300)
-        expired_notice_sent = False
+        tracker = _ExpiredNoticeTracker()
         while not stop_event.is_set():
             try:
                 _, data = _load_weread_data()
                 url = (data.get("cookie_refresh_url") or "").strip()
                 if url:
-                    ok = refresh_weread_cookie(
-                        verbose=True,
-                        headless_only=True,
-                        force_bundled=True,
-                        cooldown_hours=0,
-                    )
+                    with _browser_refresh_lock:
+                        ok = refresh_weread_cookie(
+                            verbose=True,
+                            headless_only=True,
+                            force_bundled=True,
+                            cooldown_hours=0,
+                        )
                     if ok:
-                        expired_notice_sent = False
+                        tracker.record("valid")
                     else:
                         # 刷新尝试失败本身不代表 Cookie 失效。重新读取 wx.lic，
                         # 再用书架接口确认，避免把网络/浏览器故障误报为需要扫码。
@@ -560,20 +628,21 @@ def start_weread_cookie_refresh_thread(interval_hours: float = 0.5) -> bool:
                             _cookie_status(current_cookie) if current_cookie else "unknown"
                         )
                         if cookie_status == "invalid":
-                            print("[refresh] Cookie 已确认失效，无头刷新未恢复登录态")
-                            if not expired_notice_sent:
-                                try:
-                                    _send_cookie_expired_notice()
-                                    expired_notice_sent = True
-                                    print("[refresh] 已通过配置的通知渠道提醒重新扫码")
-                                except Exception as e:
-                                    print(f"[refresh] 发送扫码提醒失败: {e}")
+                            print(
+                                "[refresh] Cookie 已确认失效，无头刷新未恢复登录态"
+                                f"（连续 {tracker.invalid_streak + 1} 次）"
+                            )
                         elif cookie_status == "valid":
-                            # 若用户已在后台重新扫码，下一次失效时可以再次提醒。
-                            expired_notice_sent = False
                             print("[refresh] 自动刷新未完成，但现有 Cookie 仍有效")
                         else:
                             print("[refresh] 自动刷新未完成，Cookie 状态无法确认")
+                        if tracker.record(cookie_status):
+                            try:
+                                _send_cookie_expired_notice()
+                                tracker.mark_sent()
+                                print("[refresh] 已通过配置的通知渠道提醒重新扫码")
+                            except Exception as e:
+                                print(f"[refresh] 发送扫码提醒失败: {e}")
                 else:
                     print("[refresh] 未配置 cookie_refresh_url，自动刷新线程等待配置")
             except Exception as e:
