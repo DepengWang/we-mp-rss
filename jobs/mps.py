@@ -598,10 +598,12 @@ class MessageTaskTracker:
                     article_batches.append(pending_articles)
                     pending_articles = []
 
+        # summary['new_articles'] 保持整轮总数；本条篇数放在 message_articles，
+        # 多条消息时 message_label 形如"（本条 5 篇，第 1/3 条）"。
         messages = []
         for batch_index, entries in enumerate(article_batches, start=1):
             batch_summary = dict(summary)
-            batch_summary['new_articles'] = len(entries)
+            batch_summary['message_articles'] = len(entries)
             messages.append((
                 f"文章推送 {batch_index}/{len(article_batches)}（{len(entries)} 篇）",
                 self._build_article_results(entries),
@@ -615,8 +617,17 @@ class MessageTaskTracker:
         )
         if summary_results:
             final_summary = dict(summary)
-            final_summary['new_articles'] = len(pending_articles)
+            final_summary['message_articles'] = len(pending_articles)
             messages.append(("汇总", summary_results, final_summary))
+
+        total_messages = len(messages)
+        for index, (_, _, message_summary) in enumerate(messages, start=1):
+            message_summary['message_index'] = index
+            message_summary['message_total'] = total_messages
+            message_summary['message_label'] = (
+                f"（本条 {message_summary['message_articles']} 篇，第 {index}/{total_messages} 条）"
+                if total_messages > 1 else ''
+            )
 
         state = {'sent': 0}
         failed = 0

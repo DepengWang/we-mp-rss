@@ -43,11 +43,14 @@ class BatchedWebhookTest(unittest.TestCase):
         self.sleep_patch.stop()
 
     def _send(self, results):
-        return self.tracker._send_batched_webhooks('task', object(), results, {'new_articles': 0})
+        total = sum(len(r.get('articles') or []) for r in results)
+        return self.tracker._send_batched_webhooks('task', object(), results, {'new_articles': total})
 
     def test_all_success_without_articles_still_sends_summary(self):
         self.assertTrue(self._send([_result('a'), _result('b')]))
         self.assertEqual(len(self.sent), 1)
+        # 只有一条消息时不加"本条/第几条"
+        self.assertEqual(self.sent[0].summary['message_label'], '')
         self.assertEqual([r['mp_name'] for r in self.sent[0].results], ['a', 'b'])
 
     def test_batches_articles_and_keeps_all_statuses_in_summary(self):
@@ -60,9 +63,14 @@ class BatchedWebhookTest(unittest.TestCase):
         self.assertTrue(self._send(results))
         # 7 篇 → 1 个满批 + 汇总（剩余 2 篇 + 3 个无文章订阅源）
         self.assertEqual(len(self.sent), 2)
-        self.assertEqual(self.sent[0].summary['new_articles'], 5)
+        # new_articles 是整轮总数，本条篇数单独放在 message_articles
+        self.assertEqual(self.sent[0].summary['new_articles'], 7)
+        self.assertEqual(self.sent[0].summary['message_articles'], 5)
+        self.assertEqual(self.sent[0].summary['message_label'], '（本条 5 篇，第 1/2 条）')
         final = self.sent[1]
-        self.assertEqual(final.summary['new_articles'], 2)
+        self.assertEqual(final.summary['new_articles'], 7)
+        self.assertEqual(final.summary['message_articles'], 2)
+        self.assertEqual(final.summary['message_label'], '（本条 2 篇，第 2/2 条）')
         self.assertEqual([r['mp_name'] for r in final.results], ['a', 'empty', 'bad', 'limited'])
         self.assertEqual(final.results[0]['message'], 'a-5；a-6')
         # 批次之间有间隔，第一条不等待

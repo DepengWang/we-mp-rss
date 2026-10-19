@@ -211,8 +211,11 @@ async def run_message_task(
         else:
             # 同步等待本次任务在队列中执行完毕，再汇总真实新增文章数，
             # 避免把"订阅号数量"误报为"新增文章数"
+            # 前端请求超时为 100 秒，这里最多等 90 秒；整轮（含账号轮转）常超过这个时间，
+            # 未跑完时明确提示数量不是最终值。
             article_total = 0
-            deadline = _time.time() + 60
+            all_done = False
+            deadline = _time.time() + 90
             while _time.time() < deadline:
                 all_done = True
                 pending = False
@@ -231,9 +234,17 @@ async def run_message_task(
                         all_done = False
                 if not pending and all_done:
                     break
-                _time.sleep(2)
+                # async 路由里不能用阻塞 sleep，否则等待期间整个服务无响应
+                await asyncio.sleep(2)
             mps["count"] = article_total
-            mps["message"] = f"已触发 {mp_count} 个订阅号同步，本次新增 {article_total} 篇文章"
+            mps["finished"] = all_done
+            if all_done:
+                mps["message"] = f"已触发 {mp_count} 个订阅号同步，本次新增 {article_total} 篇文章"
+            else:
+                mps["message"] = (
+                    f"已触发 {mp_count} 个订阅号同步，仍在采集中，目前已统计新增 {article_total} 篇，"
+                    "最终数量以推送汇总为准"
+                )
 
         return success_response(data=mps,message=mps["message"])
 
