@@ -76,8 +76,9 @@ def _run_account_rotation(timeout=None):
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
-        # 丢弃卡住的浏览器控制器，避免下一轮再在新循环里复用它。
-        WX_API.controller = None
+        # 丢弃卡住的浏览器控制器，避免下一轮再在新循环里复用它；
+        # 同时恢复被它暂停的采集队列并释放账号锁，否则本轮公众号全部排在停着的队列后面。
+        WX_API.abandon_account_operation()
         return {"ok": False, "error": f"账号轮转超过 {timeout} 秒未完成，已放弃本轮轮转"}
     return outcome
 

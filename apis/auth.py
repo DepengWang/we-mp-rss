@@ -643,50 +643,101 @@ async def wx_account_token(
     })
 
 
+ACCOUNT_OPERATION_TIMEOUT = 300
+# 超时取消后，给操作自己的 finally（恢复原账号、恢复队列）留出的收尾时间
+ACCOUNT_OPERATION_CLEANUP_GRACE = 60
+
+
+def _account_operation_timeout() -> int:
+    import os
+
+    try:
+        return max(30, int(os.getenv("ACCOUNT_OPERATION_TIMEOUT", ACCOUNT_OPERATION_TIMEOUT)))
+    except (TypeError, ValueError):
+        return ACCOUNT_OPERATION_TIMEOUT
+
+
+def _start_account_operation_job(manager, job_id, operation, describe_result, close_browser=False):
+    """在独立线程和事件循环里跑公众号账号操作，并给整体执行时间设上限。
+
+    账号操作会先暂停采集队列，结束时在 finally 里恢复；Playwright 调用一旦卡住，
+    操作停在半路，队列就一直停着，后续每轮采集都排在它后面。这里先在循环内
+    超时取消，让操作自己的 finally 收尾；取消后仍未结束，由看门狗线程从外部
+    恢复队列并释放账号锁。
+
+    close_browser: 结束后在同一循环里关闭浏览器。Playwright 对象绑定在创建它的
+    循环上，循环关闭后再在别的循环里操作旧页面会永久挂起。
+    """
+    import asyncio
+    import sys
+    import threading
+    from driver.wx import WX_API as WX_BROWSER_API
+
+    timeout = _account_operation_timeout()
+
+    def progress_callback(stage: str, message: str, progress: int) -> None:
+        manager.update(job_id, stage=stage, message=message, progress=progress)
+
+    async def run():
+        try:
+            return await asyncio.wait_for(operation(WX_BROWSER_API, progress_callback), timeout)
+        finally:
+            if close_browser:
+                try:
+                    await asyncio.wait_for(WX_BROWSER_API.Close(), 30)
+                except Exception as e:
+                    print_warning(f"账号操作结束后关闭浏览器失败：{e}")
+
+    def target() -> None:
+        # Windows 需要 ProactorEventLoop 给 Playwright 用
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        try:
+            result = asyncio.run(run())
+        except asyncio.TimeoutError:
+            manager.finish(job_id, ok=False, message=f"账号操作超过 {timeout} 秒未完成，已中止")
+            return
+        except Exception as e:
+            manager.finish(job_id, ok=False, message=f"后台任务异常: {e}")
+            return
+        ok, message = describe_result(result, manager.get_job(job_id))
+        manager.finish(job_id, ok=ok, message=message)
+
+    worker = threading.Thread(target=target, name="wechat-account-operation", daemon=True)
+    worker.start()
+
+    def watchdog() -> None:
+        worker.join(timeout + ACCOUNT_OPERATION_CLEANUP_GRACE)
+        if worker.is_alive():
+            WX_BROWSER_API.abandon_account_operation()
+            manager.finish(job_id, ok=False, message=f"账号操作超过 {timeout} 秒仍未结束，已放弃并恢复采集队列")
+
+    threading.Thread(target=watchdog, name="wechat-account-operation-watchdog", daemon=True).start()
+
+
 @router.post("/accounts/refresh", summary="手动刷新公众号账号状态（异步任务）")
 async def refresh_wx_account_status(current_user: dict = Depends(get_current_user)):
     """Inspect account expiry metadata in the background, then restore the active account."""
-    import asyncio
-    import threading
-
     user_id = current_user.get("sub") or current_user.get("username") or current_user.get("id") or "unknown"
     manager = get_switch_job_manager()
     job = manager.create_job(user_id=str(user_id), target_username="__refresh_account_status__")
     manager.update(job.job_id, stage="queued", message="已入队，准备刷新公众号账号状态", progress=0)
 
-    def _run_in_thread():
-        def _target():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                import sys
-                if sys.platform == "win32":
-                    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-                try:
-                    def progress_callback(stage: str, message: str, progress: int) -> None:
-                        manager.update(job.job_id, stage=stage, message=message, progress=progress)
-                    from driver.wx import WX_API as WX_BROWSER_API
-                    result = loop.run_until_complete(
-                        WX_BROWSER_API.refresh_account_status(progress_callback=progress_callback)
-                    )
-                    current_job = manager.get_job(job.job_id)
-                    failure_message = (
-                        current_job.message if current_job and current_job.message
-                        else "刷新失败，请查看任务进度与日志"
-                    )
-                    manager.finish(
-                        job.job_id,
-                        ok=bool(result),
-                        message=("公众号账号状态已刷新" if result else failure_message),
-                    )
-                finally:
-                    loop.close()
-            except Exception as e:
-                manager.finish(job.job_id, ok=False, message=f"刷新任务异常: {e}")
+    def describe_result(result, current_job):
+        if result:
+            return True, "公众号账号状态已刷新"
+        return False, (
+            current_job.message if current_job and current_job.message
+            else "刷新失败，请查看任务进度与日志"
+        )
 
-        threading.Thread(target=_target, daemon=True).start()
-
-    _run_in_thread()
+    # 刷新依赖扫码后留着的后台页面，结束后不关浏览器（保持原行为）
+    _start_account_operation_job(
+        manager,
+        job.job_id,
+        lambda wx, progress: wx.refresh_account_status(progress_callback=progress),
+        describe_result,
+    )
     return success_response(job.to_dict(), "账号状态刷新任务已启动")
 
 
@@ -716,8 +767,8 @@ async def switch_wechat_account(
       因此改在后台线程执行；HTTP 接口立即返回。
     * 切换期间已自动暂停抓取 / 内容任务队列，结束后自动恢复。
     * Token 失效时立即返回 ok=false 与阶段消息，前端可据此引导用户重新扫码。
+    * 整体执行有上限（ACCOUNT_OPERATION_TIMEOUT，默认 300 秒），卡死时自动恢复采集队列。
     """
-    import asyncio
     user_id = current_user.get("sub") or current_user.get("username") or current_user.get("id") or "unknown"
     manager = get_switch_job_manager()
     account_id = account_id.strip()
@@ -761,40 +812,20 @@ async def switch_wechat_account(
     job = manager.create_job(user_id=str(user_id), target_username=account_id)
     manager.update(job.job_id, stage="queued", message=f"已入队，准备切换到账号 {account_id}", progress=0)
 
-    def _run_in_thread() -> None:
-        """在新线程中跑同步包装，确保 HTTP 立即返回。"""
-        import threading
-        def _target() -> None:
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                # Windows 需要 ProactorEventLoop 给 Playwright 用
-                import sys
-                if sys.platform == "win32":
-                    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-                try:
-                    def progress_callback(stage: str, message: str, progress: int) -> None:
-                        manager.update(job.job_id, stage=stage, message=message, progress=progress)
-                    from driver.wx import WX_API as WX_BROWSER_API
-                    result = loop.run_until_complete(
-                        WX_BROWSER_API.switch_account(account_id=account_id, progress_callback=progress_callback)
-                    )
-                    current_job = manager.get_job(job.job_id)
-                    result_message = (
-                        current_job.message if current_job and current_job.message
-                        else ("账号切换成功" if result else "切换失败，请查看服务日志")
-                    )
-                    manager.finish(job.job_id, ok=bool(result), message=result_message)
-                finally:
-                    try:
-                        loop.close()
-                    except Exception:
-                        pass
-            except Exception as e:
-                manager.finish(job.job_id, ok=False, message=f"后台任务异常: {e}")
-        threading.Thread(target=_target, daemon=True).start()
+    def describe_result(result, current_job):
+        return bool(result), (
+            current_job.message if current_job and current_job.message
+            else ("账号切换成功" if result else "切换失败，请查看服务日志")
+        )
 
-    _run_in_thread()
+    # 切换后会话已按 account_id 缓存，和自动轮转一样在同一循环里关浏览器，下次从缓存恢复
+    _start_account_operation_job(
+        manager,
+        job.job_id,
+        lambda wx, progress: wx.switch_account(account_id=account_id, progress_callback=progress),
+        describe_result,
+        close_browser=True,
+    )
     return success_response(job.to_dict(), "切换任务已启动，可通过 job_id 查询进度")
 
 

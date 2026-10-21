@@ -43,6 +43,8 @@ class Wx:
         self.refresh_interval=3660*24
         self.controller=PlaywrightController()
         self._account_operation_lock = Lock()
+        # 每次账号操作的序号；操作被看门狗放弃后，迟到的 finally 不能再释放锁
+        self._account_operation_seq = 0
         self._qr_login_in_progress = False
         self._last_qr_auth_error = ""
         if not os.path.exists(self.lock_path):
@@ -571,7 +573,8 @@ class Wx:
                 record_authorized_account_session(active_id, session, summary, active=True)
                 return True
 
-        if not self._account_operation_lock.acquire(blocking=False):
+        op_id = self._begin_account_operation()
+        if op_id is None:
             raise RuntimeError("已有公众号账号操作正在进行；本次未启动扫码，以免覆盖当前授权")
 
         main_queue_was_running = False
@@ -661,7 +664,7 @@ class Wx:
                 if content_queue_was_running:
                     ContentTaskQueue.run_task_background()
             finally:
-                self._account_operation_lock.release()
+                self._end_account_operation(op_id)
 
     async def _save_qr_authorized_account(self):
         """A QR login is successful only after its full session is stored by account_id."""
@@ -686,7 +689,8 @@ class Wx:
                 except Exception:
                     pass
 
-        if not self._account_operation_lock.acquire(blocking=False):
+        op_id = self._begin_account_operation()
+        if op_id is None:
             report("failed", "已有公众号账号操作正在进行，请稍后再试", 100)
             return False
 
@@ -859,7 +863,7 @@ class Wx:
                 except Exception as e:
                     print_error(f"恢复内容抓取队列失败: {e}")
                 finally:
-                    self._account_operation_lock.release()
+                    self._end_account_operation(op_id)
 
         return scan_complete and restore_ok and original is not None
 
@@ -978,7 +982,8 @@ class Wx:
 
         from core.queue import TaskQueue, ContentTaskQueue
 
-        if not self._account_operation_lock.acquire(blocking=False):
+        op_id = self._begin_account_operation()
+        if op_id is None:
             report("failed", "已有公众号账号操作正在进行，请稍后再试", 100)
             return False
 
@@ -1189,7 +1194,7 @@ class Wx:
                     ContentTaskQueue.run_task_background()
             except Exception as e:
                 print_error(f"恢复采集队列失败: {e}")
-            self._account_operation_lock.release()
+            self._end_account_operation(op_id)
 
         if switched:
             report("done", f"已切换到：{target['name']}（{target['account_id']}）", 100)
@@ -1216,7 +1221,8 @@ class Wx:
                 except Exception:
                     pass
 
-        if not self._account_operation_lock.acquire(blocking=False):
+        op_id = self._begin_account_operation()
+        if op_id is None:
             report("failed", "已有公众号账号操作正在进行，请稍后再试", 100)
             return False
 
@@ -1448,7 +1454,7 @@ class Wx:
             except Exception as e:
                 print_error(f"恢复队列失败: {e}")
             finally:
-                self._account_operation_lock.release()
+                self._end_account_operation(op_id)
     def GetCode(self,CallBack=None,Notice=None):
         self.Notice=Notice
         self._last_qr_auth_error = ""
@@ -1934,6 +1940,42 @@ class Wx:
             return True
         except Exception as e:
             return False
+
+    def _begin_account_operation(self):
+        """获取账号操作锁，返回本次操作序号；已有操作在进行时返回 None。"""
+        if not self._account_operation_lock.acquire(blocking=False):
+            return None
+        self._account_operation_seq += 1
+        return self._account_operation_seq
+
+    def _end_account_operation(self, op_id):
+        """释放账号操作锁；该操作已被放弃时不做任何事，避免误放后续操作的锁。"""
+        if op_id is None or op_id != self._account_operation_seq:
+            return False
+        self._account_operation_seq += 1
+        self._account_operation_lock.release()
+        return True
+
+    def abandon_account_operation(self):
+        """账号操作卡死时由外部调用：丢弃浏览器控制器、恢复采集队列并释放锁。
+
+        卡住的 Playwright 调用永远走不到操作自己的 finally，采集队列会一直停着，
+        后续每轮采集都排在暂停的队列后面。采集队列在进程启动时总会启动，
+        因此这里只要队列没在跑就重新拉起。
+        """
+        self.controller = None
+        if not self._account_operation_lock.locked():
+            return False
+        from core.queue import TaskQueue, ContentTaskQueue
+        for task_queue in (TaskQueue, ContentTaskQueue):
+            try:
+                if not task_queue._is_running:
+                    task_queue.run_task_background()
+            except Exception as e:
+                print_error(f"恢复采集队列失败: {e}")
+        released = self._end_account_operation(self._account_operation_seq)
+        print_warning("账号操作超时未结束，已放弃该操作并恢复采集队列")
+        return released
 
     async def Close(self):
         rel = False

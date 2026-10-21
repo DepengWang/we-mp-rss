@@ -28,6 +28,10 @@ class _FakeWx:
         self.closed_in_loop = asyncio.get_running_loop()
         return True
 
+    def abandon_account_operation(self):
+        self.controller = None
+        return True
+
 
 class RunAccountRotationTest(unittest.TestCase):
     def _run(self, wx, timeout=5):
