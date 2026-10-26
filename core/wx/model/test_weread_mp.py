@@ -78,6 +78,25 @@ class WereadMpParsingTest(unittest.TestCase):
 
         self.assertEqual(extract_mp_content(html), '<p>Hello</p>')
 
+    def test_extract_mp_content_falls_back_to_content_noencode(self):
+        # 2026-10 微信改版后的文章页：没有 #js_content，正文在 JS 变量里
+        html = (
+            "<html><body><script>var msg = {"
+            "content_noencode: '第一段 a<b\\x0a\\x0a第二段 it\\'s',"
+            "title: 'x'};</script></body></html>"
+        )
+
+        self.assertEqual(
+            extract_mp_content(html),
+            "<p>第一段 a&lt;b</p><p>第二段 it's</p>",
+        )
+
+    def test_extract_mp_content_without_body_or_fallback_raises(self):
+        with self.assertRaises(WereadMPAPIError) as caught:
+            extract_mp_content("<html><body><p>no article</p></body></html>")
+
+        self.assertEqual(caught.exception.code, "invalid_content")
+
     def test_build_mp_url_rejects_missing_original_id(self):
         self.assertEqual(build_mp_url(""), "")
 
