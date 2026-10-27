@@ -261,4 +261,57 @@ The following are the environment variable configurations supported in `config.y
 | `LOG_LEVEL` | `INFO` | Log level |
 | `EXPORT_PDF` | `False` | Whether to enable PDF export functionality |
 
+## 本 Fork 工作进度（DepengWang/we-mp-rss）
 
+> 记录于 2026-10-19。以下内容只适用于本 fork 和生产环境 `rss.mydbo.com`，与上游无关；合并上游时注意保留这一节。
+
+### 分支与版本
+
+- 工作分支：`codex/2026-10-17-article-batch-push`（已推送到 origin，未提 PR，未推上游）
+- 线上镜像：`depeng/werss:20261026-upstream-content`（commit `0fc49599`，2026-10-26 部署）
+- 回滚镜像：`depeng/werss:20261021-switch-timeout`（commit `33b8f107`）
+
+### 已完成的改动
+
+| 方向 | 内容 |
+|---|---|
+| 上游合并 | 合并 upstream，修复 `jobs/mps.py`；补 `core/wx/model/weread_mp.py` 缺失的 `import requests` |
+| 推送分批 | 每 5 篇一条、间隔 3 秒，最后一条汇总；超出企业微信长度（errcode 40058）时自动对半拆分 |
+| 推送格式 | `WEBHOOK.WECOM_MSGTYPE=text`，纯文本 + `<a href>` 链接（手机微信/企微可点，电脑端显示原文）；汇总头部显示整轮总数和“本条 N 篇，第 i/n 条” |
+| Web 限频熔断 | 某个公众号遇到 Web 限频（ret 200013）后，本轮其余公众号直接走微信读书兜底 |
+| 微信读书 Token | 本批次失效时先在容器内无头刷新再复查；连续 2 次失效才发提醒 |
+| 免登录扫码 | 失效提醒带签名链接 `/api/v1/wx/weread/rescan?t=...`，24 小时有效，扫码成功后作废，无需登录后台 |
+| 账号轮转 | 按 account_id 轮转；服务端已失效的缓存会话标记为过期并跳过；每次轮转后在同一事件循环里关闭浏览器，等待上限 300 秒（`ACCOUNT_ROTATION_TIMEOUT`），避免整轮卡死 |
+| 手动执行接口 | `GET /message_tasks/{id}/run` 最多等 90 秒（前端超时 100 秒），未跑完时提示数量非最终值；改用 `asyncio.sleep`，等待期间不再阻塞服务 |
+| 手动切换/刷新超时（10-21） | 10-20 手动切换账号卡在 Playwright 里，采集队列停了约 20 小时。现在 `/auth/switch`、`/accounts/refresh` 最多运行 300 秒（`ACCOUNT_OPERATION_TIMEOUT`），超时后由看门狗 `abandon_account_operation()` 释放账号锁并恢复采集队列 |
+| 上游合并（10-26） | 合并 upstream `9fd4edb2`：微信文章页改版后从 `content_noencode` 兜底提取正文（修复 `invalid_content: article body was not found`）、扫码登录改走 startlogin 流程、Bark 不再打印通知内容、anyio 升到 4.14.2；补了正文兜底的单元测试 |
+
+### 部署流程（生产）
+
+1. 本地 `git -c core.autocrlf=false archive HEAD`（排除 `web_ui`、`qtserver`、`docs`、`.github`），上传后解压到新目录 `we-mp-rss-source-<tag>`。
+2. 服务器上 `sudo docker build -t depeng/werss:<tag> .`。
+3. 备份 `werss.yml`、`data/wx.lic` 为 `.bak-<tag>`，改 `werss.yml` 镜像标签，`sudo docker compose -f werss.yml up -d --no-deps we-mp-rss`。
+4. 验证 `127.0.0.1:8001` 和外网首页返回 200、定时任务已注册。
+5. 消息模板存在数据库里：`PUT /message_tasks/{id}` 会重置未传的字段，必须先 GET 完整任务、回传全部字段，再调用 `PUT /message_tasks/job/fresh`。当前模板文件：`message_template-text-20261019-v4.txt`。
+
+### 注意事项
+
+- Windows 下打包不加 `core.autocrlf=false` 会生成 CRLF，`start.sh` 无法运行。
+- `jobs/mps.py`、`driver/wx.py` 等文件是 CRLF 或混合换行，修改后用 `git diff --stat --ignore-cr-at-eol` 核对，避免整文件改动。
+- 带点的环境变量（如 `WEBHOOK.WECOM_MSGTYPE`）在 `sh` 里看不到，要从 `/proc/<pid>/environ` 核实。
+- 每次在服务器上构建镜像都会累积构建缓存（10-19 时已有 30GB，磁盘到了 91%），定期执行 `sudo docker builder prune -f`；删旧镜像本身几乎不释放空间。
+- 服务器上只保留当前和一个回滚版本的镜像与源码目录；最早手工拷贝的 `we-mp-rss-source/` 暂时保留。
+
+### 服务器安全（2026-10-19）
+
+- 人工排查：没有发现被入侵或挂马的迹象（登录记录、账号、定时任务、进程、网络连接、核心包完整性、容器、Web 日志都检查过）。
+- 已关闭 SSH 密码登录，只允许密钥：新增 `/etc/ssh/sshd_config.d/00-disable-password.conf`。回滚：删除该文件后执行 `sudo systemctl reload ssh`。
+- 待办：在腾讯云控制台确认防火墙没有放行 8080（fivefilters 监听 `0.0.0.0:8080`），或改为只绑定 `127.0.0.1`。
+
+### 待观察 / 待办
+
+- Web 采集仍被限频（日志 `frequencey control`），目前全部依赖微信读书兜底；微信读书 Cookie 每隔几小时报一次 -2012，约 30 分钟内自动轮换恢复（10-19 02:00 那一轮没有采到文章）。
+- 账号轮转日志里的“无法读取在线切换列表…请重新扫码授权”只表示没读到切换列表界面，随后会用缓存会话继续，不代表授权失效。
+- 10-26 部署后确认 `MP_WXS_3240898065` 那篇文章的正文能正常抓取。
+- 后台的三个公众号账号会话到期后需要重新扫码。
+- 早期提交 `da58706c`、`bd7d0203` 中有换行符造成的整文件改动，尚未清理。
